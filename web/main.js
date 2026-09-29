@@ -1,4 +1,4 @@
-// b2cviewer UI: picks a rigged subject file and one of its clip files from serve.py's index (or dropped .glb files),
+// b2cviewer UI: picks a subject file and (once rigged) one of its clip files from serve.py's index (or dropped .glb files),
 // plays the clip, and drives the rig worker (posing, sorting) and the renderer.
 import { Renderer } from './renderer.js';
 
@@ -35,12 +35,13 @@ function updateInfo() {
   if (!I) { $('info').textContent = ''; return; }
   const lines = [
     `${fmt(I.n)} splats · SH ${I.degree}` + (I.nUnbound ? ` · ${fmt(I.nUnbound)} unbound` : ''),
-    `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.layers.join(', ')}`,
-    I.clip ? `clip ${I.clip.name} · ${I.nframes} frames at ${I.clip.fps} fps` + (I.clip.residual ? '' : ' · no residual (plain skinning)')
+    I.rigged ? `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.layers.join(', ')}`
+             : 'not rigged: the splat as b2crunner delivered it (b2crig: tools/export_gltf.py rig)',
+    !I.rigged ? null : I.clip ? `clip ${I.clip.name} · ${I.nframes} frames at ${I.clip.fps} fps` + (I.clip.residual ? '' : ' · no residual (plain skinning)')
            : 'no clip: the rest pose',
   ];
   if (S.timing) lines.push(`last frame: rig ${S.timing.rig.toFixed(0)} ms · sort ${S.timing.sort.toFixed(0)} ms`);
-  $('info').textContent = lines.join('\n');
+  $('info').textContent = lines.filter(x => x !== null).join('\n');
 }
 
 // ---------- worker ----------
@@ -145,7 +146,7 @@ const served = p => ({ key: p, get: label => fetchBuf(url(p), label) });
 function entryOf(name = $('subject').value) {
   if (name === '(dropped)' && S.dropped) return { name, subject: S.dropped.subject, clips: S.dropped.clips.map(c => ({ name: c.name, label: c.name, source: c })) };
   const s = S.index?.subjects.find(x => x.name === name);
-  return s && s.rigged && { name: s.name, path: s.path, subject: served(s.path),
+  return s && { name: s.name, path: s.path, subject: served(s.path),
     clips: s.clips.map(c => ({ name: c.name, label: `${c.name} · ${c.frames}f`, path: c.path, source: served(c.path) })) };
 }
 
@@ -160,8 +161,8 @@ function fillSelect(sel, items, value) {
 }
 
 function fillSubjects(pref) {
-  const items = (S.index?.subjects || []).map(s => ({ value: s.name, disabled: !s.rigged, title: s.path,
-    label: s.rigged ? `${s.name} (${s.clips.length} clips)` : `${s.name} (not rigged yet)` }));
+  const items = (S.index?.subjects || []).map(s => ({ value: s.name, title: s.path,
+    label: s.rigged ? `${s.name} (${s.clips.length} clips)` : `${s.name} (not rigged: splat only)` }));
   if (S.dropped) items.unshift({ value: '(dropped)', label: `dropped: ${S.dropped.subject.name}` });
   fillSelect($('subject'), items, pref);
 }
@@ -210,11 +211,11 @@ async function init() {
     return;
   }
   const subs = S.index.subjects, rigged = subs.filter(s => s.rigged);
-  if (!rigged.length) { status(`No rigged subject files under ${S.index.root} (<subject>/gltf/*.glb).`); fillSubjects(); return; }
+  if (!subs.length) { status(`No subject files under ${S.index.root} (<subject>/gltf/*.glb).`); return; }
   const q = new URLSearchParams(location.search);
-  fillSubjects(q.get('subject') || rigged[0].name);
+  fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
-  status(`${rigged.length} rigged subjects under ${S.index.root}`);
+  status(`${subs.length} subjects (${rigged.length} rigged) under ${S.index.root}`);
   loadSelection();
 }
 
@@ -237,7 +238,7 @@ view.addEventListener('drop', e => {
     else if (/\.glb$/i.test(f.name)) subject = { ...src, name: f.name };
   }
   if (!subject && S.dropped && clips.length) subject = S.dropped.subject;   // more clips for the dropped subject
-  if (!subject) { fail('Drop a rigged subject .glb (and its .clip.glb files).'); return; }
+  if (!subject) { fail('Drop a subject .glb (and, if b2crig rigged it, its .clip.glb files).'); return; }
   S.dropped = { subject, clips: clips.sort((a, b) => a.name < b.name ? -1 : 1) };
   fillSubjects('(dropped)'); fillClips();
   loadSelection();

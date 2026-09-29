@@ -34,11 +34,12 @@ function matToQuat(m, out, o) {
 }
 
 export class Rig {
-  // splat, binding, cage: parseSubject's (gltf.js).
+  // splat, binding, cage: parseSubject's (gltf.js). Without a cage (an unrigged subject) every splat stays canonical.
   constructor(splat, binding, cage) {
+    this.splat = splat; this.cage = cage;
+    if (!cage) { this.bindF = new Int32Array(splat.n).fill(-1); this.bindB = new Float32Array(splat.n * 2); this.bindOff = new Float32Array(splat.n * 3); this.nUnbound = 0; return; }
     const { nf, faces, verts0 } = cage;
     if (binding.face.length !== splat.n) throw new Error(`the binding has ${binding.face.length} splats, the splat ${splat.n}`);
-    this.splat = splat; this.cage = cage;
     this.bindF = binding.face; this.bindB = binding.bary; this.bindOff = binding.offset;
     this.nUnbound = 0;
     for (let i = 0; i < splat.n; i++) if (this.bindF[i] < 0 || this.bindF[i] >= nf) { this.bindF[i] = -1; this.nUnbound++; }
@@ -79,6 +80,7 @@ export class Rig {
   // Face texture data for the posed cage V [nv * 3], and the posed splat centres (for sorting).
   // maxGrowth: b2ctrain's --cage-max-growth.
   frame(V, maxGrowth = 1.15) {
+    if (!this.cage) return { face: new Float32Array(FACE_TEXELS * 4), centres: this.splat.pos.slice() };   // one unused face
     const { nf, faces } = this.cage, { k0, q0 } = this;
     const face = new Float32Array(nf * FACE_TEXELS * 4), R = new Float64Array(9), q = new Float64Array(4);
     for (let f = 0; f < nf; f++) {
@@ -115,8 +117,17 @@ export class Rig {
     return { face, centres };
   }
 
-  // Centroid and bounding-box size of the posed body layer (the camera's follow target and framing).
+  // Centroid and bounding-box size of the posed body layer (the camera's follow target and framing); without a cage,
+  // of the splat centres between their 1st and 99th percentiles per axis (so floaters do not skew the framing).
   bodyCentre(V) {
+    if (!this.cage) {
+      const { n, pos } = this.splat, step = Math.max(1, Math.floor(n / 20000)), lo = [], hi = [];
+      for (let j = 0; j < 3; j++) {
+        const x = []; for (let i = 0; i < n; i += step) x.push(pos[i * 3 + j]);
+        x.sort((a, b) => a - b); lo.push(x[Math.floor(x.length * 0.01)]); hi.push(x[Math.floor(x.length * 0.99)]);
+      }
+      return { centre: lo.map((l, j) => (l + hi[j]) / 2), size: hi.map((h, j) => h - lo[j]) };
+    }
     const L = this.cage.layers[this.cage.body];
     const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity], sum = [0, 0, 0];
     for (let k = L.vOff; k < L.vOff + L.vCount; k++)

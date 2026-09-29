@@ -1,5 +1,6 @@
 // Reader for the b2c glTF files (~/Projects/b2cgltf/SPEC.md): a b2crig-rigged subject file and its clip files.
-//   parseSubject  the current splat (7.1) with b2ctrain's binding (5.3), the cage (5.2) and the skeleton (4.3)
+//   parseSubject  the current splat (7.1) with b2ctrain's binding (5.3), the cage (5.2) and the skeleton (4.3); a
+//                 file b2crig has not rigged yet gives the splat alone (shown unposed)
 //   parseClip     one clip file (6), checked against its subject: same b2c_id, same rig hash, same skeleton
 //   poseCage      a clip frame's posed cage (7.2 steps 1-2): the cage skinned by the joints relative to the skeleton
 //                 root, plus the clip's residual
@@ -81,6 +82,14 @@ function skeletonOf(json, acc, skinIndex) {
   return { joints, parents, order, root, W: nodeMatrix(json.nodes[root]), restQ, restT, ibm };
 }
 
+// The glTF world matrix of node i's parent chain (an unrigged splat sits under b2c_world, whose matrix is W).
+function worldMatrix(json, i) {
+  const parent = parentOf(json);
+  let M = new Float64Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  for (let p = parent[i]; p >= 0; p = parent[p]) { const out = new Float64Array(16); mul4(nodeMatrix(json.nodes[p]), 0, M, out, 0); M = out; }
+  return M;
+}
+
 function identities(n) {
   const m = new Float32Array(n * 16);
   for (let j = 0; j < n; j++) m[j * 16] = m[j * 16 + 5] = m[j * 16 + 10] = m[j * 16 + 15] = 1;
@@ -105,16 +114,15 @@ export async function parseSubject(buf) {
   if (!id) throw new Error('not a b2c subject file (no asset.extras.b2c_id)');
   if (json.asset.extras.b2c_stripped) throw new Error('this is a stripped distribution file (SPEC R8): it has no rig to play');
   const rig = json.extensions?.[RIG];
-  if (!rig) throw new Error('this subject file has no rig yet (b2crig: tools/export_gltf.py rig)');
-  version(rig, RIG);
+  if (rig) version(rig, RIG);
 
   // the splat
   const si = currentSplat(json);
-  if (si !== rig.splatNode) throw new Error(`the current splat (node ${si}) is not b2crig's rigged splat (node ${rig.splatNode})`);
+  if (rig && si !== rig.splatNode) throw new Error(`the current splat (node ${si}) is not b2crig's rigged splat (node ${rig.splatNode})`);
   const prim = json.meshes[json.nodes[si].mesh].primitives.find(p => p.extensions?.[KHR]), at = prim.attributes;
   const be = prim.extensions?.[BIND];
-  if (!be) throw new Error('the rigged splat has no B2CRIG_splat_cage binding');
-  version(be, BIND);
+  if (rig && !be) throw new Error('the rigged splat has no B2CRIG_splat_cage binding');
+  if (be) version(be, BIND);
   const A = s => at[`${KHR}:${s}`] !== undefined ? acc(at[`${KHR}:${s}`]) : null;
   const pos = Float32Array.from(acc(at.POSITION)), n = pos.length / 3;
   const rot = A('ROTATION'), scale = A('SCALE'), opac = A('OPACITY');
@@ -133,6 +141,7 @@ export async function parseSubject(buf) {
     for (let k = 0; k < K; k++) for (let c = 0; c < 3; c++) sh[(i * K + k) * 3 + c] = coefs[k][i * 3 + c];
   }
   const splat = { n, degree, K, pos, op, quat, ls, sh };
+  if (!rig) return { id, splat, binding: null, cage: null, skeleton: null, rigHash: null, render: {}, W: worldMatrix(json, si) };
   const binding = { face: Int32Array.from(acc(be.face)),   // 0xFFFFFFFF (unbound) wraps to -1
                     bary: Float32Array.from(acc(be.barycentric)), offset: Float32Array.from(acc(be.offset)), posing: be.posing };
 
@@ -161,7 +170,7 @@ export async function parseSubject(buf) {
   const cage = { nv, nf, layers, verts0, faces, jIdx, jW, KW, body: rig.bodyLayer ?? 0 };
   const skeleton = skeletonOf(json, acc, cageNode.skin);
   const rigHash = await hashRig(acc, cagePrims, skeleton);
-  return { id, splat, binding, cage, skeleton, rigHash, render: rig.render || {} };
+  return { id, splat, binding, cage, skeleton, rigHash, render: rig.render || {}, W: skeleton.W };
 }
 
 // B2CRIG_clip.rig.cageSha256 (SPEC 6), as b2cgltf rig.rig_hash: per cage primitive its POSITION, indices, then
@@ -192,6 +201,7 @@ export function parseClip(buf, subject) {
   const { json, acc } = readGlb(buf);
   const c = json.extensions?.[CLIP];
   if (!c) throw new Error('not a clip file (no B2CRIG_clip)');
+  if (!subject.rigHash) throw new Error('the subject file has no rig yet, so it has no clips (b2crig: tools/export_gltf.py rig)');
   version(c, CLIP);
   if (c.subject.id !== subject.id) throw new Error(`the clip belongs to subject ${c.subject.id}, not ${subject.id}`);
   if (c.rig.cageSha256 !== subject.rigHash) throw new Error('the clip was made for another rig (cageSha256 differs): re-export it');

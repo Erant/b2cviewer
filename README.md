@@ -1,7 +1,7 @@
 # b2cviewer
 
 An interactive viewer for b2crig's animated gaussian splats. It plays the b2c glTF files
-(`~/Projects/b2cgltf/SPEC.md`): a subject file that b2crig has rigged, and that subject's clip files.
+(`~/Projects/b2cgltf/SPEC.md`): a subject file and, once b2crig has rigged it, that subject's clip files.
 
 ```
 python3 serve.py [--root ~/Projects/b2crig/work] [--port 8765] [--open]
@@ -11,7 +11,8 @@ Open http://localhost:8765/ in a browser with WebGL2 (Firefox, Chrome). `serve.p
 the files read-only.
 
 - **Subject**: every subject file under `<root>/<subject>/gltf/` (`scene.glb`, or any other `.glb` that is not a
-  clip). Files b2crig has not rigged yet are listed but disabled; `tools/export_gltf.py rig` in b2crig rigs them.
+  clip). A file b2crig has not rigged yet (straight from b2crunner) shows its splat as delivered, unposed, with no
+  clips; `tools/export_gltf.py rig` in b2crig rigs it.
 - **Clip**: the `<name>.clip.glb` files beside it that belong to it (the same `b2c_id`), or the rest pose. A clip
   made for another rig (its `cageSha256` differs) or another skeleton is refused, as SPEC 6 requires; re-export it.
 - The selection is kept in the URL (`?subject=b24be4&clip=theater`), so links reopen the same view.

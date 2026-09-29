@@ -1,5 +1,6 @@
 // Worker: parses the subject and clip files (gltf.js), and per request poses a clip frame's cage, builds the face
-// texture and a back-to-front splat order for the current camera. Without a clip it shows the rest pose.
+// texture and a back-to-front splat order for the current camera. Without a clip it shows the rest pose; an unrigged
+// subject is shown as delivered.
 import { parseSubject, parseClip, poseCage } from './gltf.js';
 import { Rig } from './rig.js';
 
@@ -30,7 +31,7 @@ function sort(centres, view) {
 }
 
 const nframes = () => clip ? clip.nframes : 1;
-const posed = (fr, residual = true) => clip ? poseCage(subject, clip, fr, residual) : subject.cage.verts0;
+const posed = (fr, residual = true) => clip ? poseCage(subject, clip, fr, residual) : subject.cage?.verts0;
 
 self.onmessage = async ({ data: m }) => {
   try {
@@ -52,10 +53,11 @@ self.onmessage = async ({ data: m }) => {
         const b = rig.bodyCentre(posed(fr));
         bodies.set(b.centre, fr * 6); bodies.set(b.size, fr * 6 + 3);
       }
-      const { splat, cage, skeleton } = subject;
+      const { splat, cage } = subject;
       Object.assign(msg, {
-        bodies, n: splat.n, degree: splat.degree, nv: cage.nv, nf: cage.nf, nframes: T, nUnbound: rig.nUnbound,
-        layers: cage.layers.map(L => L.name), W: Array.from(skeleton.W), render: subject.render, id: subject.id,
+        bodies, n: splat.n, degree: splat.degree, rigged: !!cage, nv: cage?.nv ?? 0, nf: cage?.nf ?? 1, nframes: T,
+        nUnbound: rig.nUnbound, layers: cage ? cage.layers.map(L => L.name) : [], W: Array.from(subject.W),
+        render: subject.render, id: subject.id,
         clip: clip ? { name: clip.name, fps: clip.fps, residual: !!clip.residual } : null, ms: performance.now() - t0,
       });
       post(msg, transfer);
