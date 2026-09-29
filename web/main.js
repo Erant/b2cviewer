@@ -10,7 +10,7 @@ const worker = new Worker('rig-worker.js', { type: 'module' });
 
 const S = {
   index: null,
-  dropped: null,         // { subject: {key, get}, clips: [{name, key, get}] } from dropped files
+  dropped: null,         // { subject: {key, get}, clips: [{name, key, get}] } from opened / dropped local files
   loaded: { subject: null, clip: null },   // source keys currently in the worker
   info: null,            // the worker's 'loaded' message
   nframes: 0, bodies: null, W: null, Winv: null,
@@ -163,7 +163,7 @@ function fillSelect(sel, items, value) {
 function fillSubjects(pref) {
   const items = (S.index?.subjects || []).map(s => ({ value: s.name, title: s.path,
     label: s.rigged ? `${s.name} (${s.clips.length} clips)` : `${s.name} (not rigged: splat only)` }));
-  if (S.dropped) items.unshift({ value: '(dropped)', label: `dropped: ${S.dropped.subject.name}` });
+  if (S.dropped) items.unshift({ value: '(dropped)', label: `local: ${S.dropped.subject.name}` });
   fillSelect($('subject'), items, pref);
 }
 
@@ -207,11 +207,11 @@ async function init() {
   try {
     S.index = await (await fetch('/api/index')).json();
   } catch {
-    status('No index (open this page through serve.py to browse b2crig/work). Drop a subject .glb and its .clip.glb files to view them.');
+    status('No index (open this page through serve.py to browse b2crig/work). Open (or drop) a subject .glb and its .clip.glb files to view them.');
     return;
   }
   const subs = S.index.subjects, rigged = subs.filter(s => s.rigged);
-  if (!subs.length) { status(`No subject files under ${S.index.root} (<subject>/gltf/*.glb).`); return; }
+  if (!subs.length) { status(`No subject files under ${S.index.root} (<subject>/gltf/*.glb). Open local .glb files instead.`); return; }
   const q = new URLSearchParams(location.search);
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
@@ -223,16 +223,12 @@ $('subject').onchange = () => { fillClips(); loadSelection(); };
 $('clip').onchange = () => loadSelection();
 $('abSwap').onclick = swapAB;
 
-// ---------- dropped files ----------
+// ---------- local files (Open… or dropped): read in the browser, never uploaded ----------
 
-const view = $('view');
-view.addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('on'); });
-view.addEventListener('dragleave', () => $('drop').classList.remove('on'));
-view.addEventListener('drop', e => {
-  e.preventDefault(); $('drop').classList.remove('on');
+function openFiles(files) {
   let subject = null;
   const clips = [];
-  for (const f of e.dataTransfer.files) {
+  for (const f of files) {
     const src = { key: `local:${f.name}:${f.size}:${f.lastModified}`, get: () => f.arrayBuffer() };
     if (/\.clip\.glb$/i.test(f.name)) clips.push({ ...src, name: f.name.replace(/\.clip\.glb$/i, '') });
     else if (/\.glb$/i.test(f.name)) subject = { ...src, name: f.name };
@@ -242,7 +238,14 @@ view.addEventListener('drop', e => {
   S.dropped = { subject, clips: clips.sort((a, b) => a.name < b.name ? -1 : 1) };
   fillSubjects('(dropped)'); fillClips();
   loadSelection();
-});
+}
+
+const view = $('view');
+view.addEventListener('dragover', e => { e.preventDefault(); $('drop').classList.add('on'); });
+view.addEventListener('dragleave', () => $('drop').classList.remove('on'));
+view.addEventListener('drop', e => { e.preventDefault(); $('drop').classList.remove('on'); openFiles(e.dataTransfer.files); });
+$('open').onclick = () => $('openFile').click();
+$('openFile').onchange = () => { const f = [...$('openFile').files]; $('openFile').value = ''; if (f.length) openFiles(f); };
 
 // ---------- cameras ----------
 
@@ -449,6 +452,7 @@ async function saveShot() {
 $('shot').onclick = saveShot;
 
 window.addEventListener('keydown', e => {
+  if (e.key === 'o' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('openFile').click(); return; }
   if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'range' || e.target.tagName === 'SELECT') return;
   const toggle = id => { const el = $(id); if (el.disabled) return; el.checked = !el.checked; el.dispatchEvent(new Event('change')); el.dispatchEvent(new Event('input')); };
   if (e.key === ' ') { e.preventDefault(); setPlaying(!S.playing); }

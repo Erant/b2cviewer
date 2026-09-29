@@ -16,7 +16,9 @@ the files read-only.
 - **Clip**: the `<name>.clip.glb` files beside it that belong to it (the same `b2c_id`), or the rest pose. A clip
   made for another rig (its `cageSha256` differs) or another skeleton is refused, as SPEC 6 requires; re-export it.
 - The selection is kept in the URL (`?subject=b24be4&clip=theater`), so links reopen the same view.
-- You can also drop a subject `.glb` and its `.clip.glb` files onto the page.
+- **Open .glb files…** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) or dropping files onto the page views local files: a subject
+  `.glb` and its `.clip.glb` files, together or the clips later. They are read in the browser, not uploaded (the page
+  still has to come from `serve.py`; any `--root` works).
 
 ## Controls
 

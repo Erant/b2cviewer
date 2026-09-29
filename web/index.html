@@ -27,6 +27,8 @@
   label.row > span:first-child, div.row > span:first-child { width: 58px; color: var(--dim); flex: none; }
   div.row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
   div.row select { flex: 1; min-width: 0; }
+  #open { width: 100%; height: 26px; margin-bottom: 4px; border-radius: 5px; border: 1px solid var(--line); background: #262a31; color: var(--text); cursor: pointer; font: inherit; }
+  #open:hover { border-color: var(--accent); }
   #abSwap { height: 24px; padding: 0 8px; border-radius: 5px; border: 1px solid var(--line); background: #262a31; color: var(--text); cursor: pointer; }
   #abSwap:hover:not(:disabled) { border-color: var(--accent); }
   #abSwap:disabled { opacity: 0.35; cursor: default; }
@@ -68,6 +70,8 @@
 
 <div id="panel">
   <header><b>b2cviewer</b><button id="collapse" title="Collapse">▾</button></header>
+  <button id="open" title="Open a subject .glb and its .clip.glb files from this computer (read locally, not uploaded; Ctrl+O)">Open .glb files…</button>
+  <input type="file" id="openFile" accept=".glb" multiple hidden>
   <label class="row"><span>Subject</span><select id="subject"></select></label>
   <div class="row"><span>Clip</span><select id="clip"></select><button id="abSwap" disabled title="Swap with its A/B partner: CLIP and CLIP_fix, at the same frame and view (B)">⇄</button></div>
   <div class="progress" id="progress"><div></div></div>
@@ -87,7 +91,7 @@
   <div id="info"></div>
   <div id="help">Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to reset.
 <kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
-b2crig <code>tools/viewer_shot.py</code> re-renders it). Drop local .glb files to view them.</div>
+b2crig <code>tools/viewer_shot.py</code> re-renders it). Open or drop local .glb files (a subject and its clips, together or clips later) to view them; they are read in the browser, not uploaded.</div>
 </div>
 
 <div id="bar">
