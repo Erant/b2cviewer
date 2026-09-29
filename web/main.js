@@ -1,5 +1,5 @@
-// b2cviewer UI: picks a subject's splat (+ appearance MLP) and a clip's posed cage from serve.py's index (or dropped
-// files), plays the cage frames, and drives the rig worker (binding, per-frame MLP, sorting) and the renderer.
+// b2cviewer UI: picks a rigged subject file and one of its clip files from serve.py's index (or dropped .glb files),
+// plays the clip, and drives the rig worker (posing, sorting) and the renderer.
 import { Renderer } from './renderer.js';
 
 const $ = id => document.getElementById(id);
@@ -10,13 +10,13 @@ const worker = new Worker('rig-worker.js', { type: 'module' });
 
 const S = {
   index: null,
-  loaded: { ply: null, app: null, cage: null, cameras: null },   // source keys currently in the worker
-  clip: null,            // the clip entry of the loaded cage (cameras, WAN frames), or null for dropped files
+  dropped: null,         // { subject: {key, get}, clips: [{name, key, get}] } from dropped files
+  loaded: { subject: null, clip: null },   // source keys currently in the worker
   info: null,            // the worker's 'loaded' message
-  names: [], nframes: 0, bodies: null, cams: null,
+  nframes: 0, bodies: null, W: null, Winv: null,
   frame: 0, shown: -1, playing: false, playT0: 0,
   ready: false, busy: false, needFrame: false, needSort: false, dirty: true,
-  orbit: null, gen: 0, cached: 0, timing: null, loading: false,
+  orbit: null, timing: null, loading: false,
 };
 
 // ---------- status ----------
@@ -34,16 +34,11 @@ function updateInfo() {
   const I = S.info;
   if (!I) { $('info').textContent = ''; return; }
   const lines = [
-    `${fmt(I.n)} splats · SH ${I.degree}` + (I.hasLabels ? ` · ${fmt(I.nFallback)} bound across layers` : ' · no seg_label (any layer)') +
-      (I.nUnbound ? ` · ${fmt(I.nUnbound)} unbound` : ''),
-    `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.nframes} frames`,
+    `${fmt(I.n)} splats · SH ${I.degree}` + (I.nUnbound ? ` · ${fmt(I.nUnbound)} unbound` : ''),
+    `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.layers.join(', ')}`,
+    I.clip ? `clip ${I.clip.name} · ${I.nframes} frames at ${I.clip.fps} fps` + (I.clip.residual ? '' : ' · no residual (plain skinning)')
+           : 'no clip: the rest pose',
   ];
-  if (I.app) {
-    const a = I.app;
-    lines.push(`MLP ${a.version} · dead zone ${a.dz.toFixed(2)}` + (a.nfeat > 6 ? ' · occlusion' : '') +
-      (a.maxDp > 0 ? ` · offset ≤ ${(a.maxDp * 100).toFixed(0)} cm` : '') + (a.maxDo <= 0 ? ' · opacity may only fall' : '') +
-      `\nMLP cache ${S.cached}/${I.nframes} frames`);
-  } else lines.push(I.appError ? `MLP not loaded: ${I.appError}` : 'no appearance MLP for this splat');
   if (S.timing) lines.push(`last frame: rig ${S.timing.rig.toFixed(0)} ms · sort ${S.timing.sort.toFixed(0)} ms`);
   $('info').textContent = lines.join('\n');
 }
@@ -58,15 +53,12 @@ worker.onmessage = ({ data: m }) => {
     S.busy = false;
     if (m.type === 'frame') {
       renderer.setFace(m.face, S.info.nf);
-      if (m.vout) renderer.setVout(m.vout, S.info.nv);
       S.shown = m.fr;
       S.timing = { rig: m.msRig, sort: m.msSort };
       updateInfo();
     }
     renderer.setOrder(m.order);
     S.dirty = true;
-  } else if (m.type === 'precomputed') {
-    if (m.gen === S.gen) { S.cached = m.fr + 1; updateInfo(); }
   } else if (m.type === 'error') {
     console.error(m.stack);
     S.busy = false;
@@ -94,49 +86,47 @@ async function fetchBuf(url, label) {
   return out.buffer;
 }
 
-// sources: { ply, app, cage, cameras } each { key, get: () => Promise<ArrayBuffer | object> } (app may be null);
-// only the ones whose key changed are fetched and sent.
-async function load(src, clip) {
+// subject, clip: { key, get: label => Promise<ArrayBuffer> }; clip null = the rest pose. Only changed files are sent.
+async function load(subject, clip) {
   if (S.loading) return;
   S.loading = true;
   setInputs(false);
-  worker.postMessage({ type: 'cancel', gen: S.gen });
   try {
     const msg = { type: 'load' }, transfer = [];
-    const changed = k => src[k] !== undefined && (src[k]?.key ?? null) !== S.loaded[k];
-    for (const [k, label] of [['ply', 'splat'], ['cage', 'cage'], ['app', 'MLP']]) {
-      if (!changed(k)) continue;
-      msg[k] = src[k] ? await src[k].get(label) : null;
-      if (msg[k]) transfer.push(msg[k]);
+    const newSubject = subject.key !== S.loaded.subject;
+    if (newSubject) { msg.subject = await subject.get('subject'); transfer.push(msg.subject); }
+    if (newSubject || (clip?.key ?? null) !== S.loaded.clip) {
+      msg.clip = clip ? await clip.get('clip') : null;
+      if (msg.clip) transfer.push(msg.clip);
     }
-    const newCams = changed('cameras');
-    const cams = newCams && src.cameras ? await src.cameras.get() : null;
     progress(0);
     const info = await workerLoad(msg, transfer);
-    for (const k of ['ply', 'cage', 'app', 'cameras']) if (src[k] !== undefined) S.loaded[k] = src[k]?.key ?? null;
-    if (info.partial) { status('Drop the remaining files (a .ply and a .b2ccage are needed).'); return; }
-    if (newCams) S.cams = cams ? indexCameras(cams) : null;
-    S.clip = clip;
+    S.loaded = { subject: subject.key, clip: clip?.key ?? null };
     if (info.splatTex) renderer.setSplats(info.splatTex, info.n);
     if (info.sh) renderer.setSH(info.sh, info.n, info.degree);
-    renderer.hasVout = false;
+    if (newSubject) {
+      setW(info.W);
+      const r = info.render;   // b2ctrain's render settings from B2CRIG_rig
+      $('maxGrowth').value = r.maxGrowth ?? 1.15;
+      $('fade').checked = r.fadeEnd > r.fadeStart && r.fadeStart > 0;
+      if ($('fade').checked) { $('fadeStart').value = r.fadeStart; $('fadeEnd').value = r.fadeEnd; }
+      S.orbit = null;
+    }
     S.info = info;
-    S.names = info.names; S.nframes = info.nframes;
-    if (info.bodies) S.bodies = smoothBodies(info.bodies, info.nframes);
-    if (!S.orbit) resetOrbit();   // first load or another subject; otherwise keep the user's view
+    S.nframes = info.nframes;
+    S.bodies = smoothBodies(info.bodies, info.nframes);
+    if (!S.orbit) resetOrbit();   // another subject; otherwise keep the user's view
     S.frame = Math.min(S.frame, S.nframes - 1);
+    if (info.clip) $('fps').value = info.clip.fps;
     $('slider').max = S.nframes - 1;
+    $('residual').disabled = !info.clip?.residual;
     S.ready = true; S.needFrame = true; S.dirty = true; S.shown = -1;
-    S.cached = 0; S.gen++;
-    if (info.app) worker.postMessage({ type: 'precompute', gen: S.gen });
-    $('clipCam').disabled = !S.cams;
-    $('showRef').disabled = !clip?.wan;
-    applyRefPanel();
     updateInfo(); updateFrameLabel();
-    status(info.appError ? `Loaded without the MLP: ${info.appError}` : `Loaded in ${(info.ms / 1000).toFixed(1)} s (binding + MLP set-up).`, !!info.appError);
+    status(`Loaded in ${(info.ms / 1000).toFixed(1)} s.`);
   } catch (e) {
     console.error(e);
     fail(e.message);
+    if (e.message.includes('clip')) S.loaded.clip = undefined;   // the worker kept its previous clip: reload next time
   } finally {
     progress(null);
     S.loading = false;
@@ -144,45 +134,50 @@ async function load(src, clip) {
   }
 }
 
-function setInputs(on) { for (const id of ['subject', 'run', 'clip']) $(id).disabled = !on; }
+function setInputs(on) { for (const id of ['subject', 'clip']) $(id).disabled = !on; }
 
-// ---------- server index ----------
+// ---------- subjects and clips ----------
 
-function subjectOf() { return S.index?.subjects.find(s => s.name === $('subject').value); }
+const url = p => `/data/${p.split('/').map(encodeURIComponent).join('/')}`;
+const served = p => ({ key: p, get: label => fetchBuf(url(p), label) });
+
+// { name, subject: source, clips: [{ name, label, source }] } for the selected entry
+function entryOf(name = $('subject').value) {
+  if (name === '(dropped)' && S.dropped) return { name, subject: S.dropped.subject, clips: S.dropped.clips.map(c => ({ name: c.name, label: c.name, source: c })) };
+  const s = S.index?.subjects.find(x => x.name === name);
+  return s && s.rigged && { name: s.name, path: s.path, subject: served(s.path),
+    clips: s.clips.map(c => ({ name: c.name, label: `${c.name} · ${c.frames}f`, path: c.path, source: served(c.path) })) };
+}
 
 function fillSelect(sel, items, value) {
   sel.innerHTML = '';
   for (const it of items) {
     const o = document.createElement('option');
-    o.value = it.value; o.textContent = it.label; o.title = it.title || '';
+    o.value = it.value; o.textContent = it.label; o.title = it.title || ''; o.disabled = !!it.disabled;
     sel.appendChild(o);
   }
-  if (value !== undefined && items.some(i => i.value === value)) sel.value = value;
+  if (value !== undefined && items.some(i => i.value === value && !i.disabled)) sel.value = value;
 }
 
-function fillRuns(pref) {
-  const s = subjectOf();
-  const runs = [...s.runs].sort((a, b) => (!!b.app - !!a.app) || b.mtime - a.mtime);
-  fillSelect($('run'), runs.map(r => ({ value: r.tag, label: `${r.tag}${r.app ? ' · MLP' : ''}`, title: `${r.ply} (${r.ply_mb} MB)${r.app ? '\n' + r.app + ' ' + r.app_version : ''}` })), pref);
+function fillSubjects(pref) {
+  const items = (S.index?.subjects || []).map(s => ({ value: s.name, disabled: !s.rigged, title: s.path,
+    label: s.rigged ? `${s.name} (${s.clips.length} clips)` : `${s.name} (not rigged yet)` }));
+  if (S.dropped) items.unshift({ value: '(dropped)', label: `dropped: ${S.dropped.subject.name}` });
+  fillSelect($('subject'), items, pref);
 }
 
 function fillClips(pref) {
-  const s = subjectOf(), run = s.runs.find(r => r.tag === $('run').value);
-  const ok = c => !run?.app_nv || c.nv === run.app_nv;
-  fillSelect($('clip'), s.clips.map(c => ({ value: c.name, label: `${c.name} · ${c.frames}f${ok(c) ? '' : ' · other cage'}`,
-    title: `${c.cage}\n${c.nv} vertices${ok(c) ? '' : ' (the MLP was trained on a cage with ' + run.app_nv + ': it will be off)'}` })), pref);
-  if (!pref || !s.clips.some(c => c.name === pref)) {
-    const best = s.clips.find(c => ok(c) && c.name.startsWith('d_')) || s.clips.find(ok) || s.clips[0];
-    if (best) $('clip').value = best.name;
-  }
+  const e = entryOf();
+  fillSelect($('clip'), [{ value: '', label: 'rest pose' }, ...(e?.clips || []).map(c => ({ value: c.name, label: c.label, title: c.path || '' }))], pref);
+  if (!pref && e?.clips.length) $('clip').value = e.clips[0].name;
 }
 
-// A/B partners: CLIP and CLIP_fix (e.g. a retarget fix baked next to the original clip). Swapping keeps the
-// splat, the frame and the view; only the cage (and its cameras) reload.
+// A/B partners: CLIP and CLIP_fix (e.g. a retarget fix exported next to the original clip). Swapping keeps the
+// frame and the view; only the clip reloads.
 function partnerOf(name) {
-  const s = subjectOf(); if (!s || !name) return null;
+  const e = entryOf(); if (!e || !name) return null;
   const other = name.endsWith('_fix') ? name.slice(0, -4) : `${name}_fix`;
-  return s.clips.some(c => c.name === other) ? other : null;
+  return e.clips.some(c => c.name === other) ? other : null;
 }
 function updateAB() {
   const name = $('clip').value, other = partnerOf(name), badge = $('abBadge');
@@ -199,40 +194,31 @@ function swapAB() {
 }
 
 function loadSelection() {
-  const s = subjectOf(); if (!s) return;
-  const run = s.runs.find(r => r.tag === $('run').value), clip = s.clips.find(c => c.name === $('clip').value);
-  if (!run || !clip) return;
-  const url = p => `/data/${p.split('/').map(encodeURIComponent).join('/')}`;
-  const buf = p => ({ key: p, get: label => fetchBuf(url(p), label) });
-  const q = new URLSearchParams({ subject: s.name, run: run.tag, clip: clip.name });
-  history.replaceState(null, '', `?${q}`);
+  const e = entryOf(); if (!e) return;
+  const clip = e.clips.find(c => c.name === $('clip').value);
+  if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '' })}`);
+  else history.replaceState(null, '', location.pathname);
   updateAB();
-  load({
-    ply: buf(run.ply), app: run.app ? buf(run.app) : null, cage: buf(clip.cage),
-    cameras: clip.cameras ? { key: clip.cameras, get: () => fetch(url(clip.cameras)).then(r => r.json()) } : null,
-  }, { ...clip, wanUrl: clip.wan ? url(clip.wan) : null });
+  load(e.subject, clip?.source ?? null);
 }
 
 async function init() {
   try {
     S.index = await (await fetch('/api/index')).json();
   } catch {
-    status('No index (open this page through serve.py to browse b2crig/work). Drop .ply / .app / .b2ccage files to view them.');
+    status('No index (open this page through serve.py to browse b2crig/work). Drop a subject .glb and its .clip.glb files to view them.');
     return;
   }
-  const subs = S.index.subjects;
-  if (!subs.length) { status(`No subjects with trained splats and clips under ${S.index.root}.`); return; }
+  const subs = S.index.subjects, rigged = subs.filter(s => s.rigged);
+  if (!rigged.length) { status(`No rigged subject files under ${S.index.root} (<subject>/gltf/*.glb).`); fillSubjects(); return; }
   const q = new URLSearchParams(location.search);
-  const dflt = q.get('subject') || (subs.find(s => s.runs.some(r => r.app)) || subs[0]).name;
-  fillSelect($('subject'), subs.map(s => ({ value: s.name, label: `${s.name} (${s.runs.length} trained, ${s.clips.length} clips)` })), dflt);
-  fillRuns(q.get('run'));
-  fillClips(q.get('clip'));
-  status(`${subs.length} subjects under ${S.index.root}`);
+  fillSubjects(q.get('subject') || rigged[0].name);
+  fillClips(q.get('clip') ?? undefined);
+  status(`${rigged.length} rigged subjects under ${S.index.root}`);
   loadSelection();
 }
 
-$('subject').onchange = () => { fillRuns(); fillClips(); S.orbit = null; loadSelection(); };
-$('run').onchange = () => { fillClips($('clip').value); loadSelection(); };
+$('subject').onchange = () => { fillClips(); loadSelection(); };
 $('clip').onchange = () => loadSelection();
 $('abSwap').onclick = swapAB;
 
@@ -243,32 +229,41 @@ view.addEventListener('dragover', e => { e.preventDefault(); $('drop').classList
 view.addEventListener('dragleave', () => $('drop').classList.remove('on'));
 view.addEventListener('drop', e => {
   e.preventDefault(); $('drop').classList.remove('on');
-  const src = {};
+  let subject = null;
+  const clips = [];
   for (const f of e.dataTransfer.files) {
-    const key = `local:${f.name}:${f.size}:${f.lastModified}`, get = () => f.arrayBuffer();
-    if (/\.ply$/i.test(f.name)) src.ply = { key, get };
-    else if (/\.app$/i.test(f.name)) src.app = { key, get };
-    else if (/\.b2ccage$/i.test(f.name)) src.cage = { key, get };
-    else if (/\.json$/i.test(f.name)) src.cameras = { key, get: async () => JSON.parse(await f.text()) };
+    const src = { key: `local:${f.name}:${f.size}:${f.lastModified}`, get: () => f.arrayBuffer() };
+    if (/\.clip\.glb$/i.test(f.name)) clips.push({ ...src, name: f.name.replace(/\.clip\.glb$/i, '') });
+    else if (/\.glb$/i.test(f.name)) subject = { ...src, name: f.name };
   }
-  if (!Object.keys(src).length) { fail('Drop .ply, .app, .b2ccage (and optionally a cameras.json) files.'); return; }
-  if (src.cage && !src.cameras) src.cameras = null;
-  history.replaceState(null, '', location.pathname);
-  if (src.cage) { $('abBadge').classList.remove('on'); $('abSwap').disabled = true; }   // a dropped cage has no partner
-  load(src, src.cage ? null : S.clip);
+  if (!subject && S.dropped && clips.length) subject = S.dropped.subject;   // more clips for the dropped subject
+  if (!subject) { fail('Drop a rigged subject .glb (and its .clip.glb files).'); return; }
+  S.dropped = { subject, clips: clips.sort((a, b) => a.name < b.name ? -1 : 1) };
+  fillSubjects('(dropped)'); fillClips();
+  loadSelection();
 });
 
 // ---------- cameras ----------
 
+// W maps the b2crunner frame (the posed data) to glTF world (+Y up, subject facing +Z). The orbit lives in glTF
+// world; the renderer gets it in the b2crunner frame.
+function setW(W) {   // column-major 4x4, rigid
+  const R = [0, 1, 2].map(r => [0, 1, 2].map(c => W[c * 4 + r])), t = [W[12], W[13], W[14]];
+  S.W = { R, t };
+  const Ri = [0, 1, 2].map(r => [0, 1, 2].map(c => R[c][r]));
+  S.Winv = { R: Ri, t: Ri.map(row => -(row[0] * t[0] + row[1] * t[1] + row[2] * t[2])) };
+}
+const apply = (T, p) => T.R.map((row, r) => row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + T.t[r]);
+
 function smoothBodies(b, n) {
-  // follow target: the body centroid, smoothed over +-0.5 s so the camera glides instead of shaking with the arms
+  // follow target: the body centroid in glTF world, smoothed over +-0.5 s so the camera glides instead of shaking
   const out = new Float32Array(n * 3), k = 8;
   for (let f = 0; f < n; f++) {
     let s = [0, 0, 0], c = 0;
     for (let g = Math.max(0, f - k); g <= Math.min(n - 1, f + k); g++, c++) for (let j = 0; j < 3; j++) s[j] += b[g * 6 + j];
-    for (let j = 0; j < 3; j++) out[f * 3 + j] = s[j] / c;
+    out.set(apply(S.W, s.map(x => x / c)), f * 3);
   }
-  out.size = [b[3], b[4], b[5]];
+  out.size = [0, 1, 2].map(r => Math.abs(S.W.R[r][0]) * b[3] + Math.abs(S.W.R[r][1]) * b[4] + Math.abs(S.W.R[r][2]) * b[5]);
   return out;
 }
 
@@ -285,11 +280,6 @@ function bodyTarget(fr) {
   return [S.bodies[f * 3], S.bodies[f * 3 + 1], S.bodies[f * 3 + 2]];
 }
 
-function indexCameras(j) {
-  const byName = new Map(j.cameras.map(c => [c.name, c]));
-  return { W: j.width, H: j.height, list: j.cameras, byName };
-}
-
 // OpenGL camera-to-world (columns right, up, back) + position -> the renderer's OpenCV world-to-camera
 function glToCam(Rgl, pos) {
   const R = [Rgl[0][0], Rgl[1][0], Rgl[2][0], -Rgl[0][1], -Rgl[1][1], -Rgl[2][1], -Rgl[0][2], -Rgl[1][2], -Rgl[2][2]];
@@ -297,15 +287,8 @@ function glToCam(Rgl, pos) {
   return { R, t, pos };
 }
 
+// The orbit camera in the b2crunner frame (right / up stay in glTF world for panning).
 function camera(fr, W, H) {
-  if ($('clipCam').checked && S.cams) {
-    const c = S.cams.byName.get(S.names[fr]) || S.cams.list[fr];
-    if (c) {
-      const s = Math.min(W / S.cams.W, H / S.cams.H);
-      return { ...glToCam(c.rotation, c.position), fx: c.fx * s, fy: c.fy * s,
-               cx: W / 2 + (c.cx - S.cams.W / 2) * s, cy: H / 2 + (c.cy - S.cams.H / 2) * s };
-    }
-  }
   const o = S.orbit || { az: 0, el: 5, dist: 3, pan: [0, 0, 0], target: [0, 1, 0] };
   const base = $('follow').checked ? bodyTarget(fr) : o.target;
   const tgt = base.map((x, j) => x + o.pan[j]);
@@ -313,9 +296,11 @@ function camera(fr, W, H) {
   const back = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
   const pos = tgt.map((x, j) => x + o.dist * back[j]);
   const right = norm(cross([0, 1, 0], back)), up = cross(back, right);
-  const Rgl = [[right[0], up[0], back[0]], [right[1], up[1], back[1]], [right[2], up[2], back[2]]];
+  const Wi = S.Winv || { R: [[1, 0, 0], [0, 1, 0], [0, 0, 1]], t: [0, 0, 0] }, rot = v => apply({ R: Wi.R, t: [0, 0, 0] }, v);
+  const [r, u, b] = [rot(right), rot(up), rot(back)];
+  const Rgl = [[r[0], u[0], b[0]], [r[1], u[1], b[1]], [r[2], u[2], b[2]]];
   const f = (H / 2) / Math.tan(+$('fov').value * Math.PI / 360);
-  return { ...glToCam(Rgl, pos), fx: f, fy: f, cx: W / 2, cy: H / 2, right, up };
+  return { ...glToCam(Rgl, apply(Wi, pos)), fx: f, fy: f, cx: W / 2, cy: H / 2, right, up };
 }
 const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const norm = a => { const l = Math.hypot(...a) || 1; return a.map(x => x / l); };
@@ -335,7 +320,6 @@ canvas.addEventListener('pointermove', e => {
   if (!drag || !S.orbit) return;
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   drag.x = e.clientX; drag.y = e.clientY;
-  if ($('clipCam').checked && S.cams) leaveClipCam();
   const o = S.orbit;
   if (drag.pan) {
     const c = camera(S.shown < 0 ? 0 : S.shown, canvas.width, canvas.height);
@@ -352,23 +336,10 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
   if (!S.orbit) return;
-  if ($('clipCam').checked && S.cams) leaveClipCam();
   S.orbit.dist = Math.max(0.1, S.orbit.dist * Math.exp(e.deltaY * 0.001));
   S.needSort = true; S.dirty = true;
 }, { passive: false });
-canvas.addEventListener('dblclick', () => { $('clipCam').checked = false; resetOrbit(); });
-
-function leaveClipCam() {
-  // continue orbiting from where the clip camera was (azimuth / elevation / distance around the body)
-  const fr = S.shown < 0 ? 0 : S.shown, c = S.cams.byName.get(S.names[fr]) || S.cams.list[fr];
-  $('clipCam').checked = false;
-  if (!c || !S.orbit) return;
-  const tgt = $('follow').checked ? bodyTarget(fr) : S.orbit.target;
-  const d = c.position.map((x, j) => x - tgt[j]), r = Math.hypot(...d);
-  S.orbit.az = Math.atan2(d[0], d[2]) * 180 / Math.PI;
-  S.orbit.el = Math.asin(d[1] / r) * 180 / Math.PI;
-  S.orbit.dist = r; S.orbit.pan = [0, 0, 0];
-}
+canvas.addEventListener('dblclick', () => resetOrbit());
 
 $('follow').onchange = () => {
   if (!S.orbit) return;
@@ -377,11 +348,11 @@ $('follow').onchange = () => {
   S.orbit.pan = [0, 0, 0];
   S.needSort = true; S.dirty = true;
 };
-for (const id of ['clipCam', 'fov']) $(id).addEventListener('input', () => { S.needSort = true; S.dirty = true; });
+$('fov').addEventListener('input', () => { S.needSort = true; S.dirty = true; });
 
 // ---------- playback ----------
 
-function fps() { return Math.max(1, +$('fps').value || 16); }
+function fps() { return Math.max(1, +$('fps').value || 30); }
 function setFrame(f) {
   if (!S.nframes) return;
   S.frame = ((f % S.nframes) + S.nframes) % S.nframes;
@@ -390,7 +361,7 @@ function setFrame(f) {
 }
 function updateFrameLabel() {
   $('slider').value = S.frame;
-  $('frameLabel').textContent = S.nframes ? `${S.frame + 1} / ${S.nframes} · ${S.names[S.frame] ?? ''}` : '–';
+  $('frameLabel').textContent = S.nframes ? `${S.frame + 1} / ${S.nframes}` : '–';
 }
 function setPlaying(p) {
   S.playing = p && S.nframes > 1;
@@ -403,23 +374,15 @@ $('fps').onchange = () => setPlaying(S.playing);
 
 // ---------- options ----------
 
-for (const id of ['useApp', 'maxGrowth']) $(id).addEventListener('change', () => { S.needFrame = true; S.dirty = true; });
-for (const id of ['debugApp', 'fade', 'fadeStart', 'fadeEnd', 'degree', 'bg']) $(id).addEventListener('input', () => { S.dirty = true; });
-$('showRef').onchange = applyRefPanel;
+for (const id of ['residual', 'maxGrowth']) $(id).addEventListener('change', () => { S.needFrame = true; S.dirty = true; });
+for (const id of ['fade', 'fadeStart', 'fadeEnd', 'degree', 'bg']) $(id).addEventListener('input', () => { S.dirty = true; });
 $('collapse').onclick = () => { $('panel').classList.toggle('collapsed'); $('collapse').textContent = $('panel').classList.contains('collapsed') ? '▸' : '▾'; };
 
-function applyRefPanel() {
-  const on = $('showRef').checked && !!S.clip?.wanUrl;
-  $('ref').classList.toggle('on', on);
-  if (on && !$('clipCam').checked && S.cams) { $('clipCam').checked = true; S.needSort = true; }
-  S.refName = null; S.dirty = true;
-}
+function frameOpts() { return { maxGrowth: +$('maxGrowth').value || 0, residual: $('residual').checked }; }
 
 function renderOpts() {
-  const a = S.info?.app, bg = $('bg').value;
+  const bg = $('bg').value;
   return {
-    app: $('useApp').checked ? ($('debugApp').checked ? 2 : 1) : 0,
-    appLim: a ? [a.maxDo, a.maxDs, a.maxDp] : [0, 0, 0],
     fade: $('fade').checked ? [+$('fadeStart').value, +$('fadeEnd').value] : [0, 0],
     degree: +$('degree').value,
     bg: [1, 3, 5].map(i => parseInt(bg.slice(i, i + 2), 16) / 255),
@@ -428,9 +391,9 @@ function renderOpts() {
 
 // ---------- save the view ----------
 
-// A PNG of the canvas with a tEXt chunk "b2cviewer" holding JSON: what is loaded, the frame shown, the render options
-// and the camera as a b2crig cameras.json entry (rotation = camera -> world with columns right, up, back), so
-// b2crig's tools/viewer_shot.py can render exactly this view with b2ctrain.
+// A PNG of the canvas with a tEXt chunk "b2cviewer" holding JSON: the files loaded (paths under serve.py's root), the
+// frame shown, the render options and the camera as a b2crig cameras.json entry in the b2crunner frame (rotation =
+// camera -> world with columns right, up, back), so b2crig's tools/viewer_shot.py can render exactly this view.
 const CRC = (() => {
   const t = new Uint32Array(256);
   for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
@@ -461,15 +424,14 @@ async function saveShot() {
   const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
   const R = cam.R, sg = [1, -1, -1];   // OpenCV world -> camera (row-major) to OpenGL camera -> world columns
   const rotation = [0, 1, 2].map(i => [0, 1, 2].map(j => R[j * 3 + i] * sg[j]));
-  const q = new URLSearchParams(location.search);
+  const q = new URLSearchParams(location.search), e = entryOf();
   const meta = {
-    subject: q.get('subject'), run: q.get('run'), clip: q.get('clip'),
-    ply: S.loaded.ply, cage: S.loaded.cage, app: S.loaded.app,
-    frame: fr, frame_name: S.names[fr] ?? null, clip_camera: $('clipCam').checked && !!S.cams,
-    width: W, height: H,
-    camera: { name: S.names[fr] ?? String(fr), fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy, rotation, position: cam.pos },
+    subject: q.get('subject'), clip: S.info.clip?.name ?? null,
+    subject_file: e?.path ?? S.loaded.subject, clip_file: e?.clips.find(c => c.name === $('clip').value)?.path ?? S.loaded.clip,
+    frame: fr, width: W, height: H,
+    camera: { name: String(fr), fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy, rotation, position: cam.pos },
     orbit: S.orbit, follow: $('follow').checked, fov_deg: +$('fov').value,
-    options: { ...renderOpts(), maxGrowth: +$('maxGrowth').value || 0, useApp: $('useApp').checked && !!S.info?.app },
+    options: { ...renderOpts(), ...frameOpts() },
     url: location.href, saved: new Date().toISOString(),
   };
   const png = pngWithText(new Uint8Array(await blob.arrayBuffer()), 'b2cviewer', JSON.stringify(meta));
@@ -478,7 +440,7 @@ async function saveShot() {
   const safe = s => String(s ?? 'local').replace(/[^\w.-]+/g, '_');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([png], { type: 'image/png' }));
-  a.download = `b2cview_${safe(meta.subject)}_${safe(meta.run)}_${safe(meta.clip)}_f${String(fr).padStart(4, '0')}_${stamp}.png`;
+  a.download = `b2cview_${safe(meta.subject)}_${safe(meta.clip ?? 'rest')}_f${String(fr).padStart(4, '0')}_${stamp}.png`;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
   status(`Saved ${a.download}`);
@@ -491,11 +453,8 @@ window.addEventListener('keydown', e => {
   if (e.key === ' ') { e.preventDefault(); setPlaying(!S.playing); }
   else if (e.key === 'ArrowRight') { setPlaying(false); setFrame(S.frame + 1); }
   else if (e.key === 'ArrowLeft') { setPlaying(false); setFrame(S.frame - 1); }
-  else if (e.key === 'a') toggle('useApp');
-  else if (e.key === 'd') toggle('debugApp');
-  else if (e.key === 'c') toggle('clipCam');
+  else if (e.key === 'r') toggle('residual');
   else if (e.key === 'f') toggle('follow');
-  else if (e.key === 'w') toggle('showRef');
   else if (e.key === 's') saveShot();
   else if (e.key === 'b') swapAB();
 });
@@ -513,8 +472,7 @@ function pump() {
   if (!S.ready || S.busy || S.loading) return;
   if (S.needFrame) {
     S.needFrame = false; S.needSort = false; S.busy = true;
-    worker.postMessage({ type: 'frame', fr: S.frame, view: sortView(S.frame),
-                         opts: { maxGrowth: +$('maxGrowth').value || 0, useApp: $('useApp').checked && !!S.info.app } });
+    worker.postMessage({ type: 'frame', fr: S.frame, view: sortView(S.frame), opts: frameOpts() });
   } else if (S.needSort && S.shown >= 0) {
     S.needSort = false; S.busy = true;
     worker.postMessage({ type: 'sort', view: sortView(S.shown) });
@@ -530,16 +488,12 @@ function tick(t) {
   if (S.dirty && S.shown >= 0) {
     S.dirty = false;
     renderer.render(camera(S.shown, canvas.width, canvas.height), renderOpts());
-    if ($('ref').classList.contains('on')) {
-      const name = S.names[S.shown];
-      if (name !== S.refName) { S.refName = name; $('refImg').src = `${S.clip.wanUrl}/${encodeURIComponent(name)}.png`; }
-    }
   }
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
 init();
 
-// for scripted checks (tools/compare.py): the state and a way to wait for a settled frame
+// for scripted checks: the state and a way to wait for a settled frame
 window.b2cviewer = { S, setFrame, setPlaying, renderer,
   settled: () => S.ready && !S.loading && !S.busy && !S.needFrame && !S.needSort && S.shown === S.frame && !S.dirty };

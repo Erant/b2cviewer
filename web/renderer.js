@@ -1,7 +1,7 @@
-// WebGL2 splat renderer. The vertex shader poses each splat from the cage (b2ctrain cage.cu pose_bound, the stretch
-// fade, and cage_app.cu splat_apply_kernel for the MLP outputs), evaluates its SH colour in the triangle's canonical
-// frame, and projects it as b2ctrain's rasteriser does (EWA, 0.3 px blur, alpha from the 1/255 contour).
-import { SPLAT_TEXELS, FACE_TEXELS, VERT_TEXELS } from './rig.js';
+// WebGL2 splat renderer. The vertex shader poses each splat from the cage (b2ctrain cage.cu pose_bound and the
+// stretch fade), evaluates its SH colour in the triangle's canonical frame, and projects it as b2ctrain's rasteriser
+// does (EWA, 0.3 px blur, alpha from the 1/255 contour).
+import { SPLAT_TEXELS, FACE_TEXELS } from './rig.js';
 
 const VS = `#version 300 es
 precision highp float;
@@ -11,11 +11,9 @@ precision highp sampler2D;
 layout(location = 0) in vec2 aCorner;
 layout(location = 1) in uint aIndex;
 
-uniform sampler2D uSplat, uSH, uFace, uVout;
-uniform ivec4 uRows;      // items per texture row: splat, sh, face, vout
+uniform sampler2D uSplat, uSH, uFace;
+uniform ivec3 uRows;      // items per texture row: splat, sh, face
 uniform int uShPer, uDegree;
-uniform int uApp;         // 0 off, 1 MLP, 2 MLP debug (magenta by |alpha|)
-uniform vec3 uAppLim;     // max_do, max_ds, max_dp
 uniform vec2 uFade;       // stretch fade start, end (0 = off)
 uniform mat3 uViewR;      // world -> camera (OpenCV: x right, y down, z ahead)
 uniform vec3 uViewT, uCamPos;
@@ -53,7 +51,7 @@ void main() {
   vec4 t0 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 0), t1 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 1);
   vec4 t2 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 2);
   vec3 pos = t0.xyz; float op = t0.w; vec4 q = t1; vec3 ls = t2.xyz; int f = int(t2.w);
-  vec4 shf = vec4(1., 0., 0., 0.), app = vec4(0.);
+  vec4 shf = vec4(1., 0., 0., 0.);
   if (f >= 0) {
     vec4 t3 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 3), t4 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 4);
     float b1 = t3.w, b2 = t4.x, w0 = 1. - b1 - b2;
@@ -70,20 +68,6 @@ void main() {
     q = qmul(dq, q);
     ls += (k0 > 0. && k > 0.) ? log(k / k0) : 0.;
     shf = dq;
-    if (uApp > 0) {
-      int ia = int(A.w), ib = int(B.w), ic = int(C.w);
-      vec4 r0 = w0 * fetch(uVout, ia, ${VERT_TEXELS}, uRows.w, 0) + b1 * fetch(uVout, ib, ${VERT_TEXELS}, uRows.w, 0) + b2 * fetch(uVout, ic, ${VERT_TEXELS}, uRows.w, 0);
-      vec4 r1 = w0 * fetch(uVout, ia, ${VERT_TEXELS}, uRows.w, 1) + b1 * fetch(uVout, ib, ${VERT_TEXELS}, uRows.w, 1) + b2 * fetch(uVout, ic, ${VERT_TEXELS}, uRows.w, 1);
-      float r8 = w0 * fetch(uVout, ia, ${VERT_TEXELS}, uRows.w, 2).x + b1 * fetch(uVout, ib, ${VERT_TEXELS}, uRows.w, 2).x + b2 * fetch(uVout, ic, ${VERT_TEXELS}, uRows.w, 2).x;
-      float al = tanh_(r0.x);
-      op += min(r1.x, uAppLim.x);
-      if (uAppLim.y > 0.) ls += uAppLim.y * tanh_(r1.y / uAppLim.y);
-      if (uAppLim.z > 0.) {
-        vec3 l = uAppLim.z * tanh3(vec3(r1.z, r1.w, r8) / uAppLim.z);
-        pos += vec3(dot(R0.xyz, l), dot(R1.xyz, l), dot(R2.xyz, l));
-      }
-      app = uApp == 2 ? vec4(1., 0., 1., abs(al)) : vec4(1. / (1. + exp(-r0.yzw)), al);
-    }
   }
 
   // projection (splat_math.cuh project_one)
@@ -132,7 +116,6 @@ void main() {
     }
   }
   col += 0.5;
-  col += app.w * (app.rgb - col);   // the MLP's blend towards its target colour
   vColor = vec4(max(col, 0.), opac);   // raster_fwd.cu composites max(colour, 0)
 
   vD = aCorner * ext;
@@ -239,10 +222,9 @@ export class Renderer {
     return perRow;
   }
 
-  setSplats(splatTex, n) { this.n = n; this.rows = this.rows || [1, 1, 1, 1]; this.rows[0] = this._texture('splat', splatTex, n, SPLAT_TEXELS, 0); }
+  setSplats(splatTex, n) { this.n = n; this.rows = this.rows || [1, 1, 1]; this.rows[0] = this._texture('splat', splatTex, n, SPLAT_TEXELS, 0); }
   setSH(sh, n, degree) { this.shPer = sh.per; this.degree = degree; this.rows[1] = this._texture('sh', sh.data, n, sh.per, 1); }
   setFace(face, nf) { this.rows[2] = this._texture('face', face, nf, FACE_TEXELS, 2); }
-  setVout(vout, nv) { this.rows[3] = this._texture('vout', vout, nv, VERT_TEXELS, 3); this.hasVout = true; }
   setOrder(order) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.orderBuf);
@@ -265,7 +247,7 @@ export class Renderer {
     this.fboSize = [W, H];
   }
 
-  // cam: { R (row-major world -> camera, OpenCV), t, pos, fx, fy, cx, cy }; opts: { app: 0|1|2, appLim, fade, degree, bg }
+  // cam: { R (row-major world -> camera, OpenCV), t, pos, fx, fy, cx, cy }; opts: { fade, degree, bg }
   render(cam, opts) {
     const gl = this.gl, W = this.canvas.width, H = this.canvas.height;
     this._target(W, H);
@@ -276,13 +258,11 @@ export class Renderer {
     if (this.count && this.tex.face) {
       const { p, u } = this.prog;
       gl.useProgram(p);
-      gl.uniform1i(u.uSplat, 0); gl.uniform1i(u.uSH, 1); gl.uniform1i(u.uFace, 2); gl.uniform1i(u.uVout, 3);
+      gl.uniform1i(u.uSplat, 0); gl.uniform1i(u.uSH, 1); gl.uniform1i(u.uFace, 2);
       for (const t of Object.values(this.tex)) { gl.activeTexture(gl.TEXTURE0 + t.unit); gl.bindTexture(gl.TEXTURE_2D, t.t); }
-      gl.uniform4i(u.uRows, ...this.rows);
+      gl.uniform3i(u.uRows, ...this.rows);
       gl.uniform1i(u.uShPer, this.shPer);
       gl.uniform1i(u.uDegree, Math.min(opts.degree ?? 3, this.degree));
-      gl.uniform1i(u.uApp, this.hasVout ? opts.app : 0);
-      gl.uniform3f(u.uAppLim, ...(opts.appLim || [0, 0, 0]));
       gl.uniform2f(u.uFade, ...(opts.fade || [0, 0]));
       const R = cam.R;   // GLSL mat3 is column-major
       gl.uniformMatrix3fv(u.uViewR, false, [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]]);

@@ -3,10 +3,10 @@
 
     python3 serve.py [--root ~/Projects/b2crig/work] [--port 8765] [--open]
 
-Then open http://localhost:8765/. The viewer lists every subject under ROOT, its trained splats
-(ROOT/<subject>/train/<tag>/scene_pruned_ev.ply or scene.ply, with the appearance MLP scene.app when there is one)
-and its clips' posed cages (ROOT/<subject>/clips/<clip>/cage_v2.b2ccage or cage.b2ccage, like tools/dance_eval.py).
-Files are served read-only from under ROOT; nothing is written.
+Then open http://localhost:8765/. The viewer lists the b2c glTF files (~/Projects/b2cgltf/SPEC.md) under
+ROOT/<subject>/gltf/: every subject file (a .glb that is not a clip, e.g. scene.glb), whether b2crig has rigged it,
+and the clip files (<name>.clip.glb) beside it that belong to it (the same b2c_id). Files are served read-only from
+under ROOT; nothing is written.
 """
 from __future__ import annotations
 
@@ -24,57 +24,41 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 WEB = Path(__file__).resolve().parent / "web"
-PLYS = ("scene_pruned_ev.ply", "scene.ply")
-CAGES = ("cage_v2.b2ccage", "cage.b2ccage")
 
 
-def cage_header(p: Path) -> dict | None:
+def glb_json(p: Path) -> dict | None:
+    """The JSON chunk of a .glb (the header and first chunk only; the BIN chunk is not read)."""
     try:
         with open(p, "rb") as f:
-            if f.read(8) != b"B2CCAGE1":
+            magic, version, _ = struct.unpack("<4sII", f.read(12))
+            n, kind = struct.unpack("<II", f.read(8))
+            if magic != b"glTF" or version != 2 or kind != 0x4E4F534A:
                 return None
-            nl, nv, nf, nfr = struct.unpack("<4i", f.read(16))
-        return {"nv": nv, "nf": nf, "frames": nfr}
-    except OSError:
-        return None
-
-
-def app_header(p: Path) -> dict | None:
-    try:
-        with open(p, "rb") as f:
-            magic = f.read(8)
-            if not magic.startswith(b"B2CAPP"):
-                return None
-            nv, nfeat, *_ = struct.unpack("<5i", f.read(20))
-        return {"nv": nv, "version": magic.decode(), "nfeat": nfeat}
-    except OSError:
+            return json.loads(f.read(n))
+    except (OSError, ValueError, struct.error):
         return None
 
 
 def index(root: Path) -> dict:
     subjects = []
-    for s in sorted(p for p in root.iterdir() if p.is_dir()):
-        runs, clips = [], []
-        for d in sorted((s / "train").glob("*/")) if (s / "train").is_dir() else []:
-            ply = next((d / n for n in PLYS if (d / n).is_file()), None)
-            if not ply:
+    for d in sorted(p for p in root.glob("*/gltf") if p.is_dir()):
+        clips = {}
+        for c in sorted(d.glob("*.clip.glb")):
+            js = glb_json(c)
+            ext = js and js.get("extensions", {}).get("B2CRIG_clip")
+            if ext:
+                anim = js["animations"][0]
+                acc = js["accessors"][anim["samplers"][0]["input"]] if anim.get("samplers") else {"count": 0}
+                clips.setdefault(ext["subject"]["id"], []).append(
+                    {"name": ext["name"], "path": str(c.relative_to(root)), "frames": acc["count"], "fps": ext["fps"]})
+        for s in sorted(p for p in d.glob("*.glb") if not p.name.endswith(".clip.glb")):
+            js = glb_json(s)
+            sid = js and js.get("asset", {}).get("extras", {}).get("b2c_id")
+            if not sid:
                 continue
-            app = d / "scene.app"
-            ah = app_header(app) if app.is_file() else None
-            runs.append({"tag": d.name, "ply": str(ply.relative_to(root)), "ply_mb": round(ply.stat().st_size / 2**20),
-                         "app": str(app.relative_to(root)) if ah else None, "app_nv": ah and ah["nv"],
-                         "app_version": ah and ah["version"], "mtime": ply.stat().st_mtime})
-        for d in sorted((s / "clips").glob("*/")) if (s / "clips").is_dir() else []:
-            cage = next((d / n for n in CAGES if (d / n).is_file()), None)
-            h = cage and cage_header(cage)
-            if not h:
-                continue
-            wan = d / "wan"
-            clips.append({"name": d.name, "cage": str(cage.relative_to(root)), **h,
-                          "cameras": str((d / "cameras.json").relative_to(root)) if (d / "cameras.json").is_file() else None,
-                          "wan": str(wan.relative_to(root)) if wan.is_dir() and any(wan.glob("*.png")) else None})
-        if runs and clips:
-            subjects.append({"name": s.name, "runs": runs, "clips": clips})
+            name = d.parent.name if s.name == "scene.glb" else f"{d.parent.name}/{s.stem}"
+            subjects.append({"name": name, "path": str(s.relative_to(root)), "mb": round(s.stat().st_size / 2**20),
+                             "rigged": "B2CRIG_rig" in js.get("extensions", {}), "clips": clips.get(sid, [])})
     return {"root": str(root), "subjects": subjects}
 
 
@@ -108,11 +92,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def send_data(self, rel: str):
         p = (self.root / rel).resolve()
-        if not p.is_relative_to(self.root) or not p.is_file():
+        if not p.is_relative_to(self.root) or not p.is_file() or p.suffix != ".glb":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", mimetypes.guess_type(p.name)[0] or "application/octet-stream")
+        self.send_header("Content-Type", "model/gltf-binary")
         self.send_header("Content-Length", str(p.stat().st_size))
         self.end_headers()
         with open(p, "rb") as f:

@@ -1,12 +1,10 @@
-// Worker: parses the subject files, binds the splat to the cage, and per request computes a frame's face / vertex
-// textures and a back-to-front splat order for the current camera.
-import { parsePly, parseCage, parseApp } from './formats.js';
+// Worker: parses the subject and clip files (gltf.js), and per request poses a clip frame's cage, builds the face
+// texture and a back-to-front splat order for the current camera. Without a clip it shows the rest pose.
+import { parseSubject, parseClip, poseCage } from './gltf.js';
 import { Rig } from './rig.js';
-import { parseGlb } from './gltf.js';
 
-let splat = null, cage = null, app = null, rig = null, minConf = 0.5;
-let glb = null, binding = null;   // a loaded .glb (gltf.js) and b2ctrain's binding from it
-let last = null;   // { fr, key, centres }: the centres of the frame last computed
+let subject = null, clip = null, rig = null;
+let last = null;   // { fr, centres }: the centres of the frame last computed
 
 const post = (msg, transfer = []) => self.postMessage(msg, transfer);
 const progress = (stage, f) => post({ type: 'progress', stage, f });
@@ -31,80 +29,49 @@ function sort(centres, view) {
   return order;
 }
 
-function optsKey(o) { return `${o.maxGrowth}|${o.useApp}`; }
+const nframes = () => clip ? clip.nframes : 1;
+const posed = (fr, residual = true) => clip ? poseCage(subject, clip, fr, residual) : subject.cage.verts0;
 
 self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
-      const t0 = performance.now();
-      let newSplat = false, newCage = false;
-      if (m.ply) { progress('parsing splat', 0); splat = parsePly(m.ply); newSplat = true; glb = null; binding = null; }
-      if (m.cage) { progress('parsing cage', 0); cage = parseCage(m.cage); newCage = true; }
-      if (m.glb) {   // splat, binding and clips in one file; the clip is an animation of it
-        progress('parsing glTF', 0); glb = await parseGlb(m.glb);
-        splat = glb.splat; binding = glb.binding; newSplat = true; app = null;
+      const t0 = performance.now(), msg = { type: 'loaded' }, transfer = [];
+      if (m.subject) {
+        progress('parsing the subject file', 0);
+        subject = await parseSubject(m.subject); clip = null;
+        rig = new Rig(subject.splat, subject.binding, subject.cage);
+        const tex = rig.splatTexels(), sh = rig.shTexels();
+        msg.splatTex = tex; msg.sh = sh; transfer.push(tex.buffer, sh.data.buffer);
       }
-      if (glb && (m.glb || m.anim !== undefined)) {
-        const ai = Math.max(0, glb.anims.indexOf(m.anim ?? glb.anims[0]));
-        progress(`posing ${glb.anims[ai]}`, 0); cage = glb.cage(ai); newCage = true;
-      }
-      if ('app' in m) app = m.app ? parseApp(m.app) : null;
-      if (m.minConf !== undefined && m.minConf !== minConf) { minConf = m.minConf; newCage = true; }
-      if (!splat || !cage) { post({ type: 'loaded', partial: true }); return; }
-      const msg = { type: 'loaded' }, transfer = [];
-      if (newSplat || newCage || !rig) {
-        rig = new Rig(splat, cage, { minConf, binding, progress: f => progress('binding splats to the cage', f) });
-        last = null;
-        const tex = rig.splatTexels();
-        msg.splatTex = tex; transfer.push(tex.buffer);
-        const bodies = new Float32Array(cage.nframes * 6);
-        for (let fr = 0; fr < cage.nframes; fr++) {
-          const b = rig.bodyCentre(fr);
-          bodies.set(b.centre, fr * 6); bodies.set(b.size, fr * 6 + 3);
-        }
-        msg.bodies = bodies;
-      }
-      if (newSplat) { const sh = rig.shTexels(); msg.sh = sh; transfer.push(sh.data.buffer); }
-      let appError = null;
-      try { progress('preparing the MLP', 0); rig.setApp(app); } catch (e) { appError = e.message; rig.setApp(null); }
+      if (!subject) throw new Error('load a subject file first (a rigged scene.glb)');
+      if ('clip' in m) { progress('parsing the clip', 0); clip = m.clip ? parseClip(m.clip, subject) : null; }
       last = null;
+      const T = nframes(), bodies = new Float32Array(T * 6);
+      for (let fr = 0; fr < T; fr++) {
+        if ((fr & 31) === 0) progress('posing the clip', fr / T);
+        const b = rig.bodyCentre(posed(fr));
+        bodies.set(b.centre, fr * 6); bodies.set(b.size, fr * 6 + 3);
+      }
+      const { splat, cage, skeleton } = subject;
       Object.assign(msg, {
-        n: splat.n, degree: splat.degree, nv: cage.nv, nf: cage.nf, nframes: cage.nframes, names: cage.names,
-        nFallback: rig.nFallback, nUnbound: rig.nUnbound, hasLabels: !!splat.labels,
-        app: rig.app ? { version: rig.app.version, nfeat: rig.app.nfeat, dz: rig.app.dz, maxDo: rig.app.maxDo, maxDs: rig.app.maxDs, maxDp: rig.app.maxDp } : null,
-        appError, ms: performance.now() - t0,
-        glb: glb ? { anims: glb.anims, render: glb.render, subject: glb.subject, residual: cage.residual, fps: cage.fps } : null,
+        bodies, n: splat.n, degree: splat.degree, nv: cage.nv, nf: cage.nf, nframes: T, nUnbound: rig.nUnbound,
+        layers: cage.layers.map(L => L.name), W: Array.from(skeleton.W), render: subject.render, id: subject.id,
+        clip: clip ? { name: clip.name, fps: clip.fps, residual: !!clip.residual } : null, ms: performance.now() - t0,
       });
       post(msg, transfer);
     } else if (m.type === 'frame') {
       if (!rig) return;
       const t0 = performance.now();
-      const fr = Math.min(Math.max(m.fr, 0), cage.nframes - 1);
-      const { face, vout, centres } = rig.frame(fr, m.opts);
+      const fr = Math.min(Math.max(m.fr, 0), nframes() - 1);
+      const { face, centres } = rig.frame(posed(fr, m.opts.residual), m.opts.maxGrowth);
       const t1 = performance.now();
-      last = { fr, key: optsKey(m.opts), centres };
+      last = { fr, centres };
       const order = sort(centres, m.view);
-      const v = vout ? vout.slice() : null;
-      const transfer = [face.buffer, order.buffer];
-      if (v) transfer.push(v.buffer);
-      post({ type: 'frame', id: m.id, fr, face, vout: v, order, msRig: t1 - t0, msSort: performance.now() - t1 }, transfer);
+      post({ type: 'frame', fr, face, order, msRig: t1 - t0, msSort: performance.now() - t1 }, [face.buffer, order.buffer]);
     } else if (m.type === 'sort') {
       if (!last) return;
-      const t0 = performance.now();
       const order = sort(last.centres, m.view);
-      post({ type: 'sort', id: m.id, fr: last.fr, order, msSort: performance.now() - t0 }, [order.buffer]);
-    } else if (m.type === 'precompute') {
-      // warm the MLP cache for every frame so playback does not stall on it
-      if (!rig || !rig.app) return;
-      const gen = m.gen;
-      for (let fr = 0; fr < cage.nframes; fr++) {
-        rig.vout(fr);
-        post({ type: 'precomputed', gen, fr, of: cage.nframes });
-        await new Promise(r => setTimeout(r, 0));   // let frame / sort requests in between
-        if (self.cancelGen !== undefined && self.cancelGen >= gen) return;
-      }
-    } else if (m.type === 'cancel') {
-      self.cancelGen = m.gen;
+      post({ type: 'sort', fr: last.fr, order }, [order.buffer]);
     }
   } catch (e) {
     post({ type: 'error', error: e.message, stack: e.stack });

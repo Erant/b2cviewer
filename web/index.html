@@ -16,10 +16,6 @@
   #view { position: relative; flex: 1; min-width: 0; }
   canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
   canvas:active { cursor: grabbing; }
-  #ref { display: none; height: 100%; border-left: 1px solid var(--line); background: #000; position: relative; }
-  #ref.on { display: block; }
-  #ref img { height: 100%; display: block; }
-  #ref span { position: absolute; left: 8px; top: 6px; color: #fff; text-shadow: 0 1px 2px #000; font-size: 12px; }
   #panel { position: absolute; left: 10px; top: 10px; width: 290px; max-height: calc(100% - 20px); overflow: auto;
            background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   #panel.collapsed > :not(header) { display: none; }
@@ -67,43 +63,38 @@
 </head>
 <body>
 <div id="stage">
-  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop .ply / .app / .b2ccage files</div></div>
-  <div id="ref"><img id="refImg" alt=""><span>WAN</span></div>
+  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop a subject .glb and its .clip.glb files</div></div>
 </div>
 
 <div id="panel">
   <header><b>b2cviewer</b><button id="collapse" title="Collapse">▾</button></header>
   <label class="row"><span>Subject</span><select id="subject"></select></label>
-  <label class="row"><span>Splat</span><select id="run"></select></label>
   <div class="row"><span>Clip</span><select id="clip"></select><button id="abSwap" disabled title="Swap with its A/B partner: CLIP and CLIP_fix, at the same frame and view (B)">⇄</button></div>
   <div class="progress" id="progress"><div></div></div>
   <div id="status">Connecting…</div>
 
-  <h3>Appearance</h3>
-  <label class="check"><input type="checkbox" id="useApp" checked> Pose-dependent MLP <small>(A)</small></label>
-  <label class="check"><input type="checkbox" id="debugApp"> Show MLP blend as magenta <small>(D)</small></label>
+  <h3>Posing</h3>
+  <label class="check"><input type="checkbox" id="residual" checked> Clip residual <small>(R; off = plain skinning)</small></label>
   <label class="check"><input type="checkbox" id="fade"> Stretch fade</label>
   <div class="inline">start <input type="number" id="fadeStart" value="1.5" step="0.1" min="1"> end <input type="number" id="fadeEnd" value="2.5" step="0.1" min="1"></div>
   <label class="row"><span>Growth</span><input type="number" id="maxGrowth" value="1.15" step="0.05" min="0"> <small style="color:var(--dim)">max triangle growth</small></label>
   <label class="row"><span>SH</span><select id="degree"><option value="3">degree 3</option><option value="2">degree 2</option><option value="1">degree 1</option><option value="0">DC only</option></select></label>
 
   <h3>Camera</h3>
-  <label class="check"><input type="checkbox" id="clipCam"> Clip camera (the WAN view) <small>(C)</small></label>
   <label class="check"><input type="checkbox" id="follow" checked> Follow the body <small>(F)</small></label>
-  <label class="check"><input type="checkbox" id="showRef"> WAN frame alongside <small>(W)</small></label>
   <label class="row"><span>FOV</span><input type="number" id="fov" value="45" step="5" min="10" max="120"> <span style="color:var(--dim)">background</span> <input type="color" id="bg" value="#808080"></label>
 
   <div id="info"></div>
   <div id="help">Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to reset.
 <kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
-b2crig <code>tools/viewer_shot.py</code> re-renders it). Drop local files to view them.</div>
+b2crig <code>tools/viewer_shot.py</code> re-renders it). Drop local .glb files to view them.</div>
 </div>
 
 <div id="bar">
   <button id="play" title="Play / pause (Space)">▶</button>
   <input type="range" id="slider" min="0" max="0" value="0">
   <span id="frameLabel">–</span>
-  <label>fps <input type="number" id="fps" value="16" min="1" max="60" step="1"></label>
+  <label>fps <input type="number" id="fps" value="30" min="1" max="60" step="1"></label>
   <button id="shot" title="Save this view as a PNG with its camera, frame and options embedded (S)">⤓ PNG</button>
 </div>
 
