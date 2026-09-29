@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>b2cviewer</title>
+<style>
+  :root {
+    --bg: #16181c; --panel: rgba(28, 31, 36, 0.92); --line: #30343b; --text: #d8dbe0; --dim: #8a9099;
+    --accent: #6aa9ff; --warn: #e8a53d; --err: #ff6b6b;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  #stage { position: absolute; inset: 0 0 52px 0; display: flex; }
+  #view { position: relative; flex: 1; min-width: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  #ref { display: none; height: 100%; border-left: 1px solid var(--line); background: #000; position: relative; }
+  #ref.on { display: block; }
+  #ref img { height: 100%; display: block; }
+  #ref span { position: absolute; left: 8px; top: 6px; color: #fff; text-shadow: 0 1px 2px #000; font-size: 12px; }
+  #panel { position: absolute; left: 10px; top: 10px; width: 290px; max-height: calc(100% - 20px); overflow: auto;
+           background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  #panel.collapsed > :not(header) { display: none; }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  header b { font-size: 14px; letter-spacing: 0.02em; }
+  header button { background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 14px; }
+  h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--dim); margin: 12px 0 4px; font-weight: 600; }
+  label.row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  label.row > span:first-child, div.row > span:first-child { width: 58px; color: var(--dim); flex: none; }
+  div.row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  div.row select { flex: 1; min-width: 0; }
+  #abSwap { height: 24px; padding: 0 8px; border-radius: 5px; border: 1px solid var(--line); background: #262a31; color: var(--text); cursor: pointer; }
+  #abSwap:hover:not(:disabled) { border-color: var(--accent); }
+  #abSwap:disabled { opacity: 0.35; cursor: default; }
+  #abBadge { position: absolute; top: 10px; left: 10px; padding: 3px 9px; border-radius: 5px; font: 600 13px system-ui, sans-serif;
+             background: rgba(20, 22, 26, 0.75); color: #e8e8e8; pointer-events: none; display: none; }
+  #abBadge.on { display: block; }
+  #abBadge.fix { color: #7ee2a8; }
+  select, input[type=number] { flex: 1; min-width: 0; background: #0f1114; color: var(--text); border: 1px solid var(--line);
+                               border-radius: 4px; padding: 3px 5px; font: inherit; }
+  input[type=number] { width: 58px; flex: none; }
+  label.check { display: flex; align-items: center; gap: 6px; margin: 3px 0; cursor: pointer; }
+  label.check small { color: var(--dim); }
+  .inline { display: flex; gap: 6px; align-items: center; margin-left: 22px; color: var(--dim); }
+  #status { margin-top: 8px; color: var(--dim); font-size: 12px; white-space: pre-wrap; }
+  #status.err { color: var(--err); }
+  #info { margin-top: 6px; color: var(--dim); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: pre-wrap; }
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; height: 52px; display: flex; align-items: center; gap: 12px;
+         padding: 0 14px; border-top: 1px solid var(--line); background: #1b1e23; font-variant-numeric: tabular-nums; }
+  #bar button { width: 34px; height: 30px; border-radius: 5px; border: 1px solid var(--line); background: #262a31; color: var(--text);
+                cursor: pointer; font-size: 14px; }
+  #bar button:hover { border-color: var(--accent); }
+  #slider { flex: 1; accent-color: var(--accent); }
+  #frameLabel { min-width: 120px; text-align: right; color: var(--dim); }
+  #bar label { color: var(--dim); display: flex; gap: 6px; align-items: center; }
+  #drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(20, 60, 120, 0.35);
+          border: 2px dashed var(--accent); font-size: 18px; pointer-events: none; }
+  #drop.on { display: flex; }
+  .progress { height: 3px; background: var(--line); border-radius: 2px; margin-top: 6px; overflow: hidden; display: none; }
+  .progress.on { display: block; }
+  .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
+  #help { color: var(--dim); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
+  kbd { background: #0f1114; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop .ply / .app / .b2ccage files</div></div>
+  <div id="ref"><img id="refImg" alt=""><span>WAN</span></div>
+</div>
+
+<div id="panel">
+  <header><b>b2cviewer</b><button id="collapse" title="Collapse">▾</button></header>
+  <label class="row"><span>Subject</span><select id="subject"></select></label>
+  <label class="row"><span>Splat</span><select id="run"></select></label>
+  <div class="row"><span>Clip</span><select id="clip"></select><button id="abSwap" disabled title="Swap with its A/B partner: CLIP and CLIP_fix, at the same frame and view (B)">⇄</button></div>
+  <div class="progress" id="progress"><div></div></div>
+  <div id="status">Connecting…</div>
+
+  <h3>Appearance</h3>
+  <label class="check"><input type="checkbox" id="useApp" checked> Pose-dependent MLP <small>(A)</small></label>
+  <label class="check"><input type="checkbox" id="debugApp"> Show MLP blend as magenta <small>(D)</small></label>
+  <label class="check"><input type="checkbox" id="fade"> Stretch fade</label>
+  <div class="inline">start <input type="number" id="fadeStart" value="1.5" step="0.1" min="1"> end <input type="number" id="fadeEnd" value="2.5" step="0.1" min="1"></div>
+  <label class="row"><span>Growth</span><input type="number" id="maxGrowth" value="1.15" step="0.05" min="0"> <small style="color:var(--dim)">max triangle growth</small></label>
+  <label class="row"><span>SH</span><select id="degree"><option value="3">degree 3</option><option value="2">degree 2</option><option value="1">degree 1</option><option value="0">DC only</option></select></label>
+
+  <h3>Camera</h3>
+  <label class="check"><input type="checkbox" id="clipCam"> Clip camera (the WAN view) <small>(C)</small></label>
+  <label class="check"><input type="checkbox" id="follow" checked> Follow the body <small>(F)</small></label>
+  <label class="check"><input type="checkbox" id="showRef"> WAN frame alongside <small>(W)</small></label>
+  <label class="row"><span>FOV</span><input type="number" id="fov" value="45" step="5" min="10" max="120"> <span style="color:var(--dim)">background</span> <input type="color" id="bg" value="#808080"></label>
+
+  <div id="info"></div>
+  <div id="help">Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to reset.
+<kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
+b2crig <code>tools/viewer_shot.py</code> re-renders it). Drop local files to view them.</div>
+</div>
+
+<div id="bar">
+  <button id="play" title="Play / pause (Space)">▶</button>
+  <input type="range" id="slider" min="0" max="0" value="0">
+  <span id="frameLabel">–</span>
+  <label>fps <input type="number" id="fps" value="16" min="1" max="60" step="1"></label>
+  <button id="shot" title="Save this view as a PNG with its camera, frame and options embedded (S)">⤓ PNG</button>
+</div>
+
+<script type="module" src="main.js"></script>
+</body>
+</html>
