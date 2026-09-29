@@ -39,9 +39,16 @@ def glb_json(p: Path) -> dict | None:
         return None
 
 
-def index(root: Path) -> dict:
+def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
+    """The /api/index JSON: the subject files in `dirs`, (name, directory) pairs under `root` (default: b2crig's
+    layout, every ROOT/<subject>/gltf/ named <subject>), each with the clip files beside it that belong to it.
+
+    A host serving another layout (b2crunner: <run>/ply/) passes its own `dirs`; `path` is relative to `root` and is
+    what the page asks /data/ for. `where` only goes into the page's message when nothing is found."""
+    if dirs is None:
+        dirs = [(p.parent.name, p) for p in sorted(root.glob("*/gltf")) if p.is_dir()]
     subjects = []
-    for d in sorted(p for p in root.glob("*/gltf") if p.is_dir()):
+    for base, d in dirs:
         clips = {}
         for c in sorted(d.glob("*.clip.glb")):
             js = glb_json(c)
@@ -56,10 +63,16 @@ def index(root: Path) -> dict:
             sid = js and js.get("asset", {}).get("extras", {}).get("b2c_id")
             if not sid:
                 continue
-            name = d.parent.name if s.name == "scene.glb" else f"{d.parent.name}/{s.stem}"
+            name = base if s.name == "scene.glb" else f"{base}/{s.stem}"
             subjects.append({"name": name, "path": str(s.relative_to(root)), "mb": round(s.stat().st_size / 2**20),
                              "rigged": "B2CRIG_rig" in js.get("extensions", {}), "clips": clips.get(sid, [])})
-    return {"root": str(root), "subjects": subjects}
+    return {"root": str(root), "where": where, "subjects": subjects}
+
+
+def data_file(root: Path, rel: str) -> Path | None:
+    """The .glb /data/REL names, or None when REL leaves ROOT or is not a .glb file."""
+    p = (root / rel).resolve()
+    return p if p.is_relative_to(root) and p.is_file() and p.suffix == ".glb" else None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -91,8 +104,8 @@ class Handler(SimpleHTTPRequestHandler):
             super().do_GET()
 
     def send_data(self, rel: str):
-        p = (self.root / rel).resolve()
-        if not p.is_relative_to(self.root) or not p.is_file() or p.suffix != ".glb":
+        p = data_file(self.root, rel)
+        if p is None:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.send_response(HTTPStatus.OK)

@@ -114,6 +114,7 @@ async function load(subject, clip) {
       S.orbit = null;
     }
     S.info = info;
+    document.body.classList.toggle('unrigged', !info.rigged);   // hide what only a rig drives (index.html .rig)
     S.nframes = info.nframes;
     S.bodies = smoothBodies(info.bodies, info.nframes);
     if (!S.orbit) resetOrbit();   // another subject; otherwise keep the user's view
@@ -139,7 +140,7 @@ function setInputs(on) { for (const id of ['subject', 'clip']) $(id).disabled = 
 
 // ---------- subjects and clips ----------
 
-const url = p => `/data/${p.split('/').map(encodeURIComponent).join('/')}`;
+const url = p => `data/${p.split('/').map(encodeURIComponent).join('/')}`;
 const served = p => ({ key: p, get: label => fetchBuf(url(p), label) });
 
 // { name, subject: source, clips: [{ name, label, source }] } for the selected entry
@@ -205,13 +206,13 @@ function loadSelection() {
 
 async function init() {
   try {
-    S.index = await (await fetch('/api/index')).json();
+    S.index = await (await fetch('api/index')).json();
   } catch {
     status('No index (open this page through serve.py to browse b2crig/work). Open (or drop) a subject .glb and its .clip.glb files to view them.');
     return;
   }
   const subs = S.index.subjects, rigged = subs.filter(s => s.rigged);
-  if (!subs.length) { status(`No subject files under ${S.index.root} (<subject>/gltf/*.glb). Open local .glb files instead.`); return; }
+  if (!subs.length) { status(`No subject files under ${S.index.root} (${S.index.where ?? '<subject>/gltf/*.glb'}). Open local .glb files instead.`); return; }
   const q = new URLSearchParams(location.search);
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);

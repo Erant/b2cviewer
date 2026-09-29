@@ -20,6 +20,13 @@ the files read-only.
   `.glb` and its `.clip.glb` files, together or the clips later. They are read in the browser, not uploaded (the page
   still has to come from `serve.py`; any `--root` works).
 
+A subject file b2crig has not rigged hides what only a rig drives: the clip picker, the posing options and the
+timeline.
+
+**Inside b2crunner**: its server serves this page at `/viewer/` over its runs (one subject per run's `ply/`, named
+after the run; `pipeline/viewer.py` there), reusing `serve.index()` and `serve.data_file()` from this checkout. The
+page's own requests are relative (`api/index`, `data/…`) so it works under such a prefix.
+
 ## Controls
 
 | | |

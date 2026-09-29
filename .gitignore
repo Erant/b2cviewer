@@ -1,1 +1,9 @@
 __pycache__/
+# never commit subject data: splats, clips, renders
+*.glb
+*.gltf
+*.ply
+*.spz
+*.splat
+*.png
+*.jpg
