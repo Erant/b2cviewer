@@ -67,13 +67,13 @@
 </head>
 <body>
 <div id="stage">
-  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop a subject .glb and its .clip.glb files</div></div>
+  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop a subject (.glb or .sog) and its clip files (.clip.glb or .clip.zip)</div></div>
 </div>
 
 <div id="panel">
   <header><b>b2cviewer</b><button id="collapse" title="Collapse">▾</button></header>
-  <button id="open" title="Open a subject .glb and its .clip.glb files from this computer (read locally, not uploaded; Ctrl+O)">Open .glb files…</button>
-  <input type="file" id="openFile" accept=".glb" multiple hidden>
+  <button id="open" title="Open a subject (.glb, or its web form .sog; any SOG splat) and its clip files (.clip.glb or .clip.zip) from this computer (read locally, not uploaded; Ctrl+O)">Open files…</button>
+  <input type="file" id="openFile" accept=".glb,.sog,.zip" multiple hidden>
   <label class="row"><span>Subject</span><select id="subject"></select></label>
   <div class="row rig"><span>Clip</span><select id="clip"></select><button id="abSwap" disabled title="Swap with its A/B partner: CLIP and CLIP_fix, at the same frame and view (B)">⇄</button></div>
   <div class="progress" id="progress"><div></div></div>
@@ -84,6 +84,8 @@
   <label class="check"><input type="checkbox" id="residual" checked> Clip residual <small>(R; off = plain skinning)</small></label>
   <label class="check"><input type="checkbox" id="fade"> Stretch fade</label>
   <div class="inline">start <input type="number" id="fadeStart" value="1.5" step="0.1" min="1"> end <input type="number" id="fadeEnd" value="2.5" step="0.1" min="1"></div>
+  <label class="check"><input type="checkbox" id="crease"> Crease fade <small>(armpit wisps)</small></label>
+  <div class="inline">gone below <input type="number" id="creaseR" value="0.04" step="0.01" min="0.01" max="0.1"> m, back by +<input type="number" id="creaseW" value="0.02" step="0.005" min="0" max="0.1"> m</div>
   <label class="row"><span>Growth</span><input type="number" id="maxGrowth" value="1.15" step="0.05" min="0"> <small style="color:var(--dim)">max triangle growth</small></label>
   </div>
 
@@ -95,7 +97,7 @@
   <div id="info"></div>
   <div id="help">Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to reset.
 <kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
-b2crig <code>tools/viewer_shot.py</code> re-renders it). Open or drop local .glb files (a subject and its clips, together or clips later) to view them; they are read in the browser, not uploaded.</div>
+b2crig <code>tools/viewer_shot.py</code> re-renders it). Open or drop local files (a subject .glb or .sog and its .clip.glb or .clip.zip clips, together or clips later) to view them; they are read in the browser, not uploaded.</div>
 </div>
 
 <div id="bar">

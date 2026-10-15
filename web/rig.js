@@ -3,7 +3,9 @@
 // texture) and the posed splat centres (depth sorting). The per-splat posing itself (position, rotation, scale, SH
 // frame) runs in the vertex shader (renderer.js) from the face texture.
 
-export const SPLAT_TEXELS = 5;   // t0 pos.xyz op | t1 quat wxyz | t2 lscale.xyz face | t3 off.xyz b1 | t4 b2
+import { creaseValues } from './crease.js';
+
+export const SPLAT_TEXELS = 5;   // t0 pos.xyz op | t1 quat wxyz | t2 lscale.xyz face | t3 off.xyz b1 | t4 b2 crease
 export const FACE_TEXELS = 7;    // a.xyz | b.xyz | c.xyz | R row0, k | R row1, k0 | R row2, ratio | dq wxyz
 
 // Triangle frame (cage.cu tri_frame): R row-major with columns (e1, e2, n); returns k = sqrt(2 area), 0 when degenerate.
@@ -35,8 +37,9 @@ function matToQuat(m, out, o) {
 
 export class Rig {
   // splat, binding, cage: parseSubject's (gltf.js). Without a cage (an unrigged subject) every splat stays canonical.
-  constructor(splat, binding, cage) {
+  constructor(splat, binding, cage, skeleton) {
     this.splat = splat; this.cage = cage;
+    this.crease = cage && skeleton ? creaseValues(splat, cage, skeleton.names) : new Float32Array(splat.n).fill(1e9);   // crease.js
     if (!cage) { this.bindF = new Int32Array(splat.n).fill(-1); this.bindB = new Float32Array(splat.n * 2); this.bindOff = new Float32Array(splat.n * 3); this.nUnbound = 0; return; }
     const { nf, faces, verts0 } = cage;
     if (binding.face.length !== splat.n) throw new Error(`the binding has ${binding.face.length} splats, the splat ${splat.n}`);
@@ -61,7 +64,7 @@ export class Rig {
       out.set(quat.subarray(i * 4, i * 4 + 4), o + 4);
       out.set(ls.subarray(i * 3, i * 3 + 3), o + 8); out[o + 11] = this.bindF[i];
       out.set(this.bindOff.subarray(i * 3, i * 3 + 3), o + 12); out[o + 15] = this.bindB[i * 2];
-      out[o + 16] = this.bindB[i * 2 + 1];
+      out[o + 16] = this.bindB[i * 2 + 1]; out[o + 17] = this.crease[i];
     }
     return out;
   }

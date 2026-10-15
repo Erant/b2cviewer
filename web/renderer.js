@@ -15,6 +15,7 @@ uniform sampler2D uSplat, uSH, uFace;
 uniform ivec3 uRows;      // items per texture row: splat, sh, face
 uniform int uShPer, uDegree;
 uniform vec2 uFade;       // stretch fade start, end (0 = off)
+uniform vec2 uCrease;     // crease fade: radius (0 = off), width in metres; opacity x 0 at crease value <= radius, x 1 at radius + width
 uniform mat3 uViewR;      // world -> camera (OpenCV: x right, y down, z ahead)
 uniform vec3 uViewT, uCamPos;
 uniform vec4 uIntr;       // fx, fy, cx, cy (pixels)
@@ -74,6 +75,7 @@ void main() {
   vec3 mc = uViewR * pos + uViewT;
   if (!(mc.z >= 0.01)) { cull(); return; }
   float opac = 1. / (1. + exp(-op));
+  if (uCrease.x > 0.) opac *= clamp((fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 4).y - uCrease.x) / max(uCrease.y, 1e-4), 0., 1.);   // crease.js
   if (!(opac >= 1. / 255.)) { cull(); return; }
   mat3 M = uViewR * qmat(q) * mat3(exp(ls.x), 0., 0., 0., exp(ls.y), 0., 0., 0., exp(ls.z));
   float iz = 1. / mc.z, rx = mc.x * iz, ry = mc.y * iz;
@@ -247,7 +249,7 @@ export class Renderer {
     this.fboSize = [W, H];
   }
 
-  // cam: { R (row-major world -> camera, OpenCV), t, pos, fx, fy, cx, cy }; opts: { fade, degree, bg }
+  // cam: { R (row-major world -> camera, OpenCV), t, pos, fx, fy, cx, cy }; opts: { fade, crease, creaseFade, degree, bg }
   render(cam, opts) {
     const gl = this.gl, W = this.canvas.width, H = this.canvas.height;
     this._target(W, H);
@@ -264,6 +266,7 @@ export class Renderer {
       gl.uniform1i(u.uShPer, this.shPer);
       gl.uniform1i(u.uDegree, Math.min(opts.degree ?? 3, this.degree));
       gl.uniform2f(u.uFade, ...(opts.fade || [0, 0]));
+      gl.uniform2f(u.uCrease, opts.crease || 0, opts.creaseFade ?? 0.02);
       const R = cam.R;   // GLSL mat3 is column-major
       gl.uniformMatrix3fv(u.uViewR, false, [R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]]);
       gl.uniform3f(u.uViewT, ...cam.t);

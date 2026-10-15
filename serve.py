@@ -3,9 +3,10 @@
 
     python3 serve.py [--root ~/Projects/b2crig/work] [--port 8765] [--open]
 
-Then open http://localhost:8765/. The viewer lists the b2c glTF files (~/Projects/b2cgltf/SPEC.md) under
-ROOT/<subject>/gltf/: every subject file (a .glb that is not a clip, e.g. scene.glb), whether b2crig has rigged it,
-and the clip files (<name>.clip.glb) beside it that belong to it (the same b2c_id). Files are served read-only from
+Then open http://localhost:8765/. The viewer lists the b2c glTF files (~/Projects/b2cgltf/SPEC.md) and their web
+forms (b2cgltf web.py) under ROOT/<subject>/gltf/: every subject file (a .glb that is not a clip, e.g. scene.glb, or
+a .sog: b2cgltf's web subject, or any plain SOG splat), whether b2crig has rigged it, and the clip files
+(<name>.clip.glb or <name>.clip.zip) beside it that belong to it (the same b2c_id). Files are served read-only from
 under ROOT; nothing is written.
 """
 from __future__ import annotations
@@ -17,6 +18,7 @@ import os
 import shutil
 import struct
 import threading
+import zipfile
 import webbrowser
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +41,47 @@ def glb_json(p: Path) -> dict | None:
         return None
 
 
+def glb_bytes_json(b: bytes) -> dict | None:
+    """The JSON chunk of a .glb held in memory."""
+    try:
+        magic, version, _, n, kind = struct.unpack_from("<4sIIII", b)
+        return json.loads(b[20:20 + n]) if magic == b"glTF" and version == 2 and kind == 0x4E4F534A else None
+    except (ValueError, struct.error):
+        return None
+
+
+def zip_member(p: Path, name: str) -> bytes | None:
+    try:
+        with zipfile.ZipFile(p) as z:
+            return z.read(name)
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+
+
+def clip_json(p: Path) -> dict | None:
+    """A clip file's glTF JSON: the .clip.glb itself, or the clip.glb inside a .clip.zip."""
+    if p.name.endswith(".clip.glb"):
+        return glb_json(p)
+    b = zip_member(p, "clip.glb")
+    return b and glb_bytes_json(b)
+
+
+def sog_subject(p: Path) -> tuple[str | None, bool] | None:
+    """(b2c_id, rigged) of a .sog: b2cgltf's web subject names its rig.glb in meta.json's `b2c`; a plain SOG has
+    neither. None when it is not a SOG."""
+    try:
+        meta = json.loads(zip_member(p, "meta.json") or b"null")
+    except ValueError:
+        return None
+    if not isinstance(meta, dict) or meta.get("version") != 2:
+        return None
+    rig = meta.get("b2c", {}).get("rig")
+    js = rig and glb_bytes_json(zip_member(p, rig) or b"")
+    if not js:
+        return None, False
+    return js.get("asset", {}).get("extras", {}).get("b2c_id"), "B2CRIG_rig" in js.get("extensions", {})
+
+
 def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
     """The /api/index JSON: the subject files in `dirs`, (name, directory) pairs under `root` (default: b2crig's
     layout, every ROOT/<subject>/gltf/ named <subject>), each with the clip files beside it that belong to it.
@@ -50,14 +93,17 @@ def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
     subjects = []
     for base, d in dirs:
         clips = {}
-        for c in sorted(d.glob("*.clip.glb")):
-            js = glb_json(c)
+        for c in sorted([*d.glob("*.clip.glb"), *d.glob("*.clip.zip")]):
+            js = clip_json(c)
             ext = js and js.get("extensions", {}).get("B2CRIG_clip")
             if ext:
                 anim = js["animations"][0]
                 acc = js["accessors"][anim["samplers"][0]["input"]] if anim.get("samplers") else {"count": 0}
-                clips.setdefault(ext["subject"]["id"], []).append(
-                    {"name": ext["name"], "path": str(c.relative_to(root)), "frames": acc["count"], "fps": ext["fps"]})
+                same = clips.setdefault(ext["subject"]["id"], [])
+                name = ext["name"]   # a web clip beside its .clip.glb gets its own name: the page keys clips by name
+                if c.name.endswith(".clip.zip") and any(x["name"] == name for x in same):
+                    name += " (zip)"
+                same.append({"name": name, "path": str(c.relative_to(root)), "frames": acc["count"], "fps": ext["fps"]})
         for s in sorted(p for p in d.glob("*.glb") if not p.name.endswith(".clip.glb")):
             js = glb_json(s)
             sid = js and js.get("asset", {}).get("extras", {}).get("b2c_id")
@@ -66,13 +112,28 @@ def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
             name = base if s.name == "scene.glb" else f"{base}/{s.stem}"
             subjects.append({"name": name, "path": str(s.relative_to(root)), "mb": round(s.stat().st_size / 2**20),
                              "rigged": "B2CRIG_rig" in js.get("extensions", {}), "clips": clips.get(sid, [])})
+        for s in sorted(d.glob("*.sog")):
+            got = sog_subject(s)
+            if got is None:
+                continue
+            sid, rigged = got
+            subjects.append({"name": f"{base}/{s.name}", "path": str(s.relative_to(root)), "mb": round(s.stat().st_size / 2**20),
+                             "rigged": rigged, "clips": clips.get(sid, []) if sid else []})
     return {"root": str(root), "where": where, "subjects": subjects}
 
 
+DATA_TYPES = {".glb": "model/gltf-binary", ".sog": "application/zip", ".clip.zip": "application/zip"}
+
+
+def data_type(p: Path) -> str:
+    return DATA_TYPES[".clip.zip" if p.name.endswith(".clip.zip") else p.suffix]
+
+
 def data_file(root: Path, rel: str) -> Path | None:
-    """The .glb /data/REL names, or None when REL leaves ROOT or is not a .glb file."""
+    """The file /data/REL names, or None when REL leaves ROOT or is not a .glb, .sog or .clip.zip file."""
     p = (root / rel).resolve()
-    return p if p.is_relative_to(root) and p.is_file() and p.suffix == ".glb" else None
+    ok = p.suffix in (".glb", ".sog") or p.name.endswith(".clip.zip")
+    return p if p.is_relative_to(root) and p.is_file() and ok else None
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -109,7 +170,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "model/gltf-binary")
+        self.send_header("Content-Type", data_type(p))
         self.send_header("Content-Length", str(p.stat().st_size))
         self.end_headers()
         with open(p, "rb") as f:

@@ -40,12 +40,12 @@ self.onmessage = async ({ data: m }) => {
       if (m.subject) {
         progress('parsing the subject file', 0);
         subject = await parseSubject(m.subject); clip = null;
-        rig = new Rig(subject.splat, subject.binding, subject.cage);
+        rig = new Rig(subject.splat, subject.binding, subject.cage, subject.skeleton);
         const tex = rig.splatTexels(), sh = rig.shTexels();
         msg.splatTex = tex; msg.sh = sh; transfer.push(tex.buffer, sh.data.buffer);
       }
       if (!subject) throw new Error('load a subject file first (a rigged scene.glb)');
-      if ('clip' in m) { progress('parsing the clip', 0); clip = m.clip ? parseClip(m.clip, subject) : null; }
+      if ('clip' in m) { progress('parsing the clip', 0); clip = m.clip ? await parseClip(m.clip, subject) : null; }
       last = null;
       const T = nframes(), bodies = new Float32Array(T * 6);
       for (let fr = 0; fr < T; fr++) {

@@ -1,4 +1,4 @@
-// b2cviewer UI: picks a subject file and (once rigged) one of its clip files from serve.py's index (or dropped .glb files),
+// b2cviewer UI: picks a subject file and (once rigged) one of its clip files from serve.py's index (or dropped local files),
 // plays the clip, and drives the rig worker (posing, sorting) and the renderer.
 import { Renderer } from './renderer.js';
 
@@ -36,7 +36,7 @@ function updateInfo() {
   const lines = [
     `${fmt(I.n)} splats · SH ${I.degree}` + (I.nUnbound ? ` · ${fmt(I.nUnbound)} unbound` : ''),
     I.rigged ? `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.layers.join(', ')}`
-             : 'not rigged: the splat as b2crunner delivered it (b2crig: tools/export_gltf.py rig)',
+             : I.id ? 'not rigged: the splat as b2crunner delivered it (b2crig: tools/export_gltf.py rig)' : 'a plain splat: no rig',
     !I.rigged ? null : I.clip ? `clip ${I.clip.name} · ${I.nframes} frames at ${I.clip.fps} fps` + (I.clip.residual ? '' : ' · no residual (plain skinning)')
            : 'no clip: the rest pose',
   ];
@@ -208,12 +208,14 @@ async function init() {
   try {
     S.index = await (await fetch('api/index')).json();
   } catch {
-    status('No index (open this page through serve.py to browse b2crig/work). Open (or drop) a subject .glb and its .clip.glb files to view them.');
+    status('No index (open this page through serve.py to browse b2crig/work). Open (or drop) a subject .glb or .sog and its clip files to view them.');
     return;
   }
   const subs = S.index.subjects, rigged = subs.filter(s => s.rigged);
-  if (!subs.length) { status(`No subject files under ${S.index.root} (${S.index.where ?? '<subject>/gltf/*.glb'}). Open local .glb files instead.`); return; }
+  if (!subs.length) { status(`No subject files under ${S.index.root} (${S.index.where ?? '<subject>/gltf/*.glb'}). Open local files instead.`); return; }
   const q = new URLSearchParams(location.search);
+  if (+q.get('crease') > 0) { $('crease').checked = true; $('creaseR').value = +q.get('crease'); }   // ?crease=0.04&creasefade=0.02
+  if (q.has('creasefade')) $('creaseW').value = +q.get('creasefade');
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
   status(`${subs.length} subjects (${rigged.length} rigged) under ${S.index.root}`);
@@ -231,11 +233,11 @@ function openFiles(files) {
   const clips = [];
   for (const f of files) {
     const src = { key: `local:${f.name}:${f.size}:${f.lastModified}`, get: () => f.arrayBuffer() };
-    if (/\.clip\.glb$/i.test(f.name)) clips.push({ ...src, name: f.name.replace(/\.clip\.glb$/i, '') });
-    else if (/\.glb$/i.test(f.name)) subject = { ...src, name: f.name };
+    if (/\.clip\.(glb|zip)$/i.test(f.name)) clips.push({ ...src, name: f.name.replace(/\.clip\.(glb|zip)$/i, '') });
+    else if (/\.(glb|sog)$/i.test(f.name)) subject = { ...src, name: f.name };
   }
   if (!subject && S.dropped && clips.length) subject = S.dropped.subject;   // more clips for the dropped subject
-  if (!subject) { fail('Drop a subject .glb (and, if b2crig rigged it, its .clip.glb files).'); return; }
+  if (!subject) { fail('Drop a subject .glb or .sog (and, if b2crig rigged it, its .clip.glb or .clip.zip files).'); return; }
   S.dropped = { subject, clips: clips.sort((a, b) => a.name < b.name ? -1 : 1) };
   fillSubjects('(dropped)'); fillClips();
   loadSelection();
@@ -380,7 +382,7 @@ $('fps').onchange = () => setPlaying(S.playing);
 // ---------- options ----------
 
 for (const id of ['residual', 'maxGrowth']) $(id).addEventListener('change', () => { S.needFrame = true; S.dirty = true; });
-for (const id of ['fade', 'fadeStart', 'fadeEnd', 'degree', 'bg']) $(id).addEventListener('input', () => { S.dirty = true; });
+for (const id of ['fade', 'fadeStart', 'fadeEnd', 'crease', 'creaseR', 'creaseW', 'degree', 'bg']) $(id).addEventListener('input', () => { S.dirty = true; });
 $('collapse').onclick = () => { $('panel').classList.toggle('collapsed'); $('collapse').textContent = $('panel').classList.contains('collapsed') ? '▸' : '▾'; };
 
 function frameOpts() { return { maxGrowth: +$('maxGrowth').value || 0, residual: $('residual').checked }; }
@@ -389,6 +391,8 @@ function renderOpts() {
   const bg = $('bg').value;
   return {
     fade: $('fade').checked ? [+$('fadeStart').value, +$('fadeEnd').value] : [0, 0],
+    crease: $('crease').checked ? +$('creaseR').value || 0 : 0,
+    creaseFade: +$('creaseW').value || 0,
     degree: +$('degree').value,
     bg: [1, 3, 5].map(i => parseInt(bg.slice(i, i + 2), 16) / 255),
   };

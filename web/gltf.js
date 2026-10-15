@@ -1,10 +1,12 @@
-// Reader for the b2c glTF files (~/Projects/b2cgltf/SPEC.md): a b2crig-rigged subject file and its clip files.
+// Reader for the b2c glTF files (~/Projects/b2cgltf/SPEC.md): a b2crig-rigged subject file and its clip files, and
+// their web forms (sog.js): a subject .sog (SOG splat + binding textures + rig.glb) and .clip.zip files.
 //   parseSubject  the current splat (7.1) with b2ctrain's binding (5.3), the cage (5.2) and the skeleton (4.3); a
-//                 file b2crig has not rigged yet gives the splat alone (shown unposed)
+//                 file b2crig has not rigged yet, or a plain .sog, gives the splat alone (shown unposed)
 //   parseClip     one clip file (6), checked against its subject: same b2c_id, same rig hash, same skeleton
 //   poseCage      a clip frame's posed cage (7.2 steps 1-2): the cage skinned by the joints relative to the skeleton
 //                 root, plus the clip's residual
 // Every array stays in the b2crunner frame (SPEC 2); the viewer applies W once, in its camera.
+import { isZip, readZip, parseSog } from './sog.js';
 
 const KHR = 'KHR_gaussian_splatting', RIG = 'B2CRIG_rig', BIND = 'B2CRIG_splat_cage', CLIP = 'B2CRIG_clip',
   RES = 'B2CRIG_cage_residual';
@@ -79,7 +81,8 @@ function skeletonOf(json, acc, skinIndex) {
   const restQ = new Float32Array(joints.length * 4), restT = new Float32Array(joints.length * 3);
   joints.forEach((n, j) => { restQ.set(json.nodes[n].rotation ?? [0, 0, 0, 1], j * 4); restT.set(json.nodes[n].translation ?? [0, 0, 0], j * 3); });
   const ibm = skin.inverseBindMatrices !== undefined ? Float32Array.from(acc(skin.inverseBindMatrices)) : identities(joints.length);
-  return { joints, parents, order, root, W: nodeMatrix(json.nodes[root]), restQ, restT, ibm };
+  const names = joints.map(n => json.nodes[n].name || '');
+  return { joints, names, parents, order, root, W: nodeMatrix(json.nodes[root]), restQ, restT, ibm };
 }
 
 // The glTF world matrix of node i's parent chain (an unrigged splat sits under b2c_world, whose matrix is W).
@@ -108,7 +111,9 @@ function nodeMatrix(nd) {   // column-major 4x4
 
 // The splat (display form converted to the renderer's: logit opacity, log scales, w x y z rotation, SH
 // coefficient-major per splat), b2ctrain's binding, the cage, the skeleton and b2ctrain's render settings.
-export async function parseSubject(buf) {
+// decode: WebP decoder for a .sog (sog.js's WebGL2 readback by default).
+export async function parseSubject(buf, decode) {
+  if (isZip(buf)) return parseWebSubject(await readZip(buf), decode);
   const { json, acc } = readGlb(buf);
   const id = json.asset?.extras?.b2c_id;
   if (!id) throw new Error('not a b2c subject file (no asset.extras.b2c_id)');
@@ -144,7 +149,25 @@ export async function parseSubject(buf) {
   if (!rig) return { id, splat, binding: null, cage: null, skeleton: null, rigHash: null, render: {}, W: worldMatrix(json, si) };
   const binding = { face: Int32Array.from(acc(be.face)),   // 0xFFFFFFFF (unbound) wraps to -1
                     bary: Float32Array.from(acc(be.barycentric)), offset: Float32Array.from(acc(be.offset)), posing: be.posing };
+  return { id, splat, binding, ...await rigOf(json, acc, rig) };
+}
 
+// A web subject: a plain SOG is a splat alone (no b2c_id, no rig). PlayCanvas shows a SOG turned 180 degrees about
+// z, and SOG files are written for that (b2csite's splats: tools/build.py), so W is that turn. b2cgltf's web subject
+// adds the binding and rig.glb, the subject file stripped to its skeleton, skin and cage, whose root carries W.
+async function parseWebSubject(files, decode) {
+  const s = await parseSog(files, decode);
+  if (!s.rig) return { id: null, splat: s.splat, binding: null, cage: null, skeleton: null, rigHash: null, render: {},
+                       W: new Float64Array([-1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) };
+  const { json, acc } = readGlb(s.rig);
+  const id = json.asset?.extras?.b2c_id, rig = json.extensions?.[RIG];
+  if (!id || !rig) throw new Error('the .sog\'s rig.glb is not a b2c rig (no b2c_id or B2CRIG_rig)');
+  version(rig, RIG);
+  return { id, splat: s.splat, binding: s.binding, ...await rigOf(json, acc, rig) };
+}
+
+// The cage, the skeleton, the rig hash and b2ctrain's render settings of a rigged file (B2CRIG_rig: rig).
+async function rigOf(json, acc, rig) {
   // the cage: one primitive per layer in b2ctrain's cage order, skinned by b2crunner's skin
   const cageNode = json.nodes[rig.cageNode], cagePrims = json.meshes[cageNode.mesh].primitives;
   const nv = rig.layers.reduce((s, L) => s + L.vertexCount, 0), nf = rig.layers.reduce((s, L) => s + L.faceCount, 0);
@@ -170,7 +193,7 @@ export async function parseSubject(buf) {
   const cage = { nv, nf, layers, verts0, faces, jIdx, jW, KW, body: rig.bodyLayer ?? 0 };
   const skeleton = skeletonOf(json, acc, cageNode.skin);
   const rigHash = await hashRig(acc, cagePrims, skeleton);
-  return { id, splat, binding, cage, skeleton, rigHash, render: rig.render || {}, W: skeleton.W };
+  return { cage, skeleton, rigHash, render: rig.render || {}, W: skeleton.W };
 }
 
 // B2CRIG_clip.rig.cageSha256 (SPEC 6), as b2cgltf rig.rig_hash: per cage primitive its POSITION, indices, then
@@ -195,10 +218,13 @@ async function hashRig(acc, prims, sk) {
 
 // ---------------------------------------------------------------- clip files
 
-// A clip file for `subject` (parseSubject's result), refused as SPEC 6 says a player must. Joint TRS come out as
-// q [T * J * 4] (x y z w), t [T * J * 3]; joints without a channel keep their rest pose.
-export function parseClip(buf, subject) {
-  const { json, acc } = readGlb(buf);
+// A clip file (.clip.glb, or its web form .clip.zip) for `subject` (parseSubject's result), refused as SPEC 6 says a
+// player must. Joint TRS come out as q [T * J * 4] (x y z w), t [T * J * 3]; joints without a channel keep their
+// rest pose. The residual comes out as { data: integer array [T * nv * 3], unit: metres per step, min: lowest integer }.
+export async function parseClip(buf, subject) {
+  const files = isZip(buf) ? await readZip(buf) : null;
+  if (files && !files.has('clip.glb')) throw new Error('not a b2c clip archive (no clip.glb)');
+  const { json, acc } = readGlb(files ? files.get('clip.glb').slice().buffer : buf);
   const c = json.extensions?.[CLIP];
   if (!c) throw new Error('not a clip file (no B2CRIG_clip)');
   if (!subject.rigHash) throw new Error('the subject file has no rig yet, so it has no clips (b2crig: tools/export_gltf.py rig)');
@@ -234,13 +260,29 @@ export function parseClip(buf, subject) {
     version(re, RES);
     if (re.frames !== T || re.vertices !== subject.cage.nv)
       throw new Error(`the residual is ${re.frames} x ${re.vertices}, the clip ${T} frames x ${subject.cage.nv} cage vertices`);
-    residual = { data: acc(re.accessor), scale: re.scale };
+    if (re.file !== undefined) residual = webResidual(files, re);
+    else residual = { data: acc(re.accessor), unit: re.scale / 32767, min: -32767 };   // normalised SHORT: max(c / 32767, -1)
   }
   return { name: c.name, fps: c.fps, nframes: T, q, t, residual };
 }
 
+// The web clip's residual (b2cgltf web.py): int16 frame deltas (frame 0 absolute) in units of `step` metres, byte
+// planes split (every low byte, then every high byte).
+function webResidual(files, re) {
+  const raw = files?.get(re.file);
+  if (!raw) throw new Error(`the clip names its residual ${re.file}, which the archive does not contain`);
+  const n = re.frames * re.vertices * 3;
+  if (raw.length !== 2 * n) throw new Error(`${re.file} has ${raw.length} bytes, ${2 * n} expected`);
+  const out = new Int32Array(n), per = re.vertices * 3;
+  for (let i = 0; i < n; i++) {
+    const d = (raw[i] | (raw[n + i] << 8)) << 16 >> 16;
+    out[i] = i < per ? d : out[i - per] + d;
+  }
+  return { data: out, unit: re.step, min: -Infinity };
+}
+
 // SPEC 7.2 steps 1-2 for frame f: skin the cage with W^-1 . joint_world . IBM (the joints relative to the skeleton
-// root), then add the residual (normalised SHORT x scale). Returns Float32Array [nv * 3] in the b2crunner frame.
+// root), then add the residual (its integers, floored at min, x unit). Returns Float32Array [nv * 3] in the b2crunner frame.
 export function poseCage(subject, clip, f, residual = true, out = new Float32Array(subject.cage.nv * 3)) {
   const sk = subject.skeleton, J = sk.joints.length, { nv, verts0, jIdx, jW, KW } = subject.cage;
   const G = new Float64Array(J * 16), L = new Float64Array(16), M = new Float64Array(J * 12);
@@ -252,7 +294,7 @@ export function poseCage(subject, clip, f, residual = true, out = new Float32Arr
       M[j * 12 + r * 4 + c] = s;
     }
   }
-  const R = residual && clip.residual, rq = R ? R.data : null, rs = R ? R.scale / 32767 : 0, ro = f * nv * 3;
+  const R = residual && clip.residual, rq = R ? R.data : null, rs = R ? R.unit : 0, rmin = R ? R.min : 0, ro = f * nv * 3;
   for (let v = 0; v < nv; v++) {
     const x = verts0[v * 3], y = verts0[v * 3 + 1], z = verts0[v * 3 + 2];
     let px = 0, py = 0, pz = 0;
@@ -263,9 +305,9 @@ export function poseCage(subject, clip, f, residual = true, out = new Float32Arr
       py += w * (M[m + 4] * x + M[m + 5] * y + M[m + 6] * z + M[m + 7]);
       pz += w * (M[m + 8] * x + M[m + 9] * y + M[m + 10] * z + M[m + 11]);
     }
-    if (rq) {   // normalised SHORT: max(c / 32767, -1)
+    if (rq) {
       const r = ro + v * 3;
-      px += Math.max(rq[r], -32767) * rs; py += Math.max(rq[r + 1], -32767) * rs; pz += Math.max(rq[r + 2], -32767) * rs;
+      px += Math.max(rq[r], rmin) * rs; py += Math.max(rq[r + 1], rmin) * rs; pz += Math.max(rq[r + 2], rmin) * rs;
     }
     out[v * 3] = px; out[v * 3 + 1] = py; out[v * 3 + 2] = pz;
   }

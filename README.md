@@ -11,13 +11,18 @@ Open http://localhost:8765/ in a browser with WebGL2 (Firefox, Chrome). `serve.p
 the files read-only.
 
 - **Subject**: every subject file under `<root>/<subject>/gltf/` (`scene.glb`, or any other `.glb` that is not a
-  clip). A file b2crig has not rigged yet (straight from b2crunner) shows its splat as delivered, unposed, with no
-  clips; `tools/export_gltf.py rig` in b2crig rigs it.
-- **Clip**: the `<name>.clip.glb` files beside it that belong to it (the same `b2c_id`), or the rest pose. A clip
-  made for another rig (its `cageSha256` differs) or another skeleton is refused, as SPEC 6 requires; re-export it.
+  clip), and every `.sog` there (listed as `<subject>/<file>`). A file b2crig has not rigged yet (straight from
+  b2crunner) shows its splat as delivered, unposed, with no clips; `tools/export_gltf.py rig` in b2crig rigs it.
+- **Clip**: the `<name>.clip.glb` and `<name>.clip.zip` files beside it that belong to it (the same `b2c_id`), or the
+  rest pose. A clip made for another rig (its `cageSha256` differs) or another skeleton is refused, as SPEC 6
+  requires; re-export it. A `.clip.zip` beside a `.clip.glb` of the same name is listed as `<name> (zip)`.
+- **Web forms** (b2cgltf SPEC 10, `python -m b2cgltf.web`): a rigged subject's `.sog` (a SOG splat with the binding
+  and the rig) and its `.clip.zip` clips play like the glTF files. Any other SOG (b2csite's splats, splat-transform
+  output) is shown as a plain splat, turned 180 degrees about z as PlayCanvas shows SOG files. Reading a `.sog` needs
+  WebGL2 in a worker (OffscreenCanvas) to decode its WebP textures without premultiplying alpha.
 - The selection is kept in the URL (`?subject=b24be4&clip=theater`), so links reopen the same view.
-- **Open .glb files…** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) or dropping files onto the page views local files: a subject
-  `.glb` and its `.clip.glb` files, together or the clips later. They are read in the browser, not uploaded (the page
+- **Open files…** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) or dropping files onto the page views local files: a subject
+  `.glb` or `.sog` and its `.clip.glb` or `.clip.zip` files, together or the clips later. They are read in the browser, not uploaded (the page
   still has to come from `serve.py`; any `--root` works).
 
 A subject file b2crig has not rigged hides what only a rig drives: the clip picker, the posing options and the
@@ -51,6 +56,9 @@ It mirrors `b2ctrain render --cage CAGE --cage-max-growth 1.15`:
   against the subject (`b2c_id`, the rig hash, the skeleton copy) and poses a frame's cage as SPEC 7.2 says: skinning
   by the joints relative to the skeleton root, plus the clip's `B2CRIG_cage_residual`. All of this stays in the
   b2crunner frame; the orbit camera lives in glTF world and is mapped through `W`.
+- `web/sog.js` reads the web forms: a ZIP reader (deflate through `DecompressionStream`) and a SOG v2 decoder that
+  gives the splat in the same form as a subject file's, plus the binding textures and `rig.glb` of a web subject
+  (gltf.js takes the rig from there as from a subject file).
 - `web/rig.js` ports `gpu/cage.cu`'s posing: per frame it builds the posed triangle frames (with the growth clamp) and
   the posed splat centres.
 - `web/rig-worker.js` runs the parsing, posing and depth sorting off the UI thread.
