@@ -18,8 +18,9 @@ function sort(centres, view) {
   for (let i = 0; i < n; i++) {
     const d = r0 * centres[i * 3] + r1 * centres[i * 3 + 1] + r2 * centres[i * 3 + 2] + tz;
     depth[i] = d;
-    if (d < lo) lo = d;
-    if (d > hi) hi = d;
+    const r = depth[i];   // the float32 rounding: lo and hi must bound these, or a key can land outside 0..65535
+    if (r < lo) lo = r;
+    if (r > hi) hi = r;
   }
   const scale = hi > lo ? 65535 / (hi - lo) : 0;
   const key = new Uint16Array(n), count = new Uint32Array(65537);
