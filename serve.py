@@ -5,9 +5,9 @@
 
 Then open http://localhost:8765/. The viewer lists the b2c glTF files (~/Projects/b2cgltf/SPEC.md) and their web
 forms (b2cgltf web.py) under ROOT/<subject>/gltf/: every subject file (a .glb that is not a clip, e.g. scene.glb, or
-a .sog: b2cgltf's web subject, or any plain SOG splat), whether b2crig has rigged it, and the clip files
-(<name>.clip.glb or <name>.clip.zip) beside it that belong to it (the same b2c_id). Files are served read-only from
-under ROOT; nothing is written.
+a .sog: b2cgltf's web subject, or any plain SOG splat; or a <name>.lods/ folder: b2cgltf's streamed web subject with
+its LOD levels), whether b2crig has rigged it, and the clip files (<name>.clip.glb or <name>.clip.zip) beside it
+that belong to it (the same b2c_id). Files are served read-only from under ROOT; nothing is written.
 """
 from __future__ import annotations
 
@@ -82,6 +82,25 @@ def sog_subject(p: Path) -> tuple[str | None, bool] | None:
     return js.get("asset", {}).get("extras", {}).get("b2c_id"), "B2CRIG_rig" in js.get("extensions", {})
 
 
+def lods_subject(p: Path) -> tuple[str | None, bool] | None:
+    """(b2c_id, rigged) of a streamed web subject (b2cgltf SPEC 10.3): a <name>.lods/ folder whose lod-meta.json has
+    b2cgltf's `b2c` key, naming the shared rig.glb when rigged. None otherwise."""
+    try:
+        meta = json.loads((p / "lod-meta.json").read_text())
+    except (OSError, ValueError):
+        return None
+    b2c = meta.get("b2c") if isinstance(meta, dict) else None
+    if not isinstance(b2c, dict):
+        return None
+    if not b2c.get("rig"):
+        return None, False
+    try:
+        js = glb_bytes_json((p / b2c["rig"]).read_bytes())
+    except OSError:
+        return None
+    return (js.get("asset", {}).get("extras", {}).get("b2c_id"), True) if js else None
+
+
 def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
     """The /api/index JSON: the subject files in `dirs`, (name, directory) pairs under `root` (default: b2crig's
     layout, every ROOT/<subject>/gltf/ named <subject>), each with the clip files beside it that belong to it.
@@ -119,10 +138,19 @@ def index(root: Path, dirs=None, where: str = "<subject>/gltf/*.glb") -> dict:
             sid, rigged = got
             subjects.append({"name": f"{base}/{s.name}", "path": str(s.relative_to(root)), "mb": round(s.stat().st_size / 2**20),
                              "rigged": rigged, "clips": clips.get(sid, []) if sid else []})
+        for s in sorted(d.glob("*.lods")):
+            got = lods_subject(s)
+            if got is None:
+                continue
+            sid, rigged = got
+            mb = round(sum(f.stat().st_size for f in s.rglob("*") if f.is_file()) / 2**20)
+            subjects.append({"name": f"{base}/{s.name}", "path": str(s.relative_to(root)), "mb": mb, "rigged": rigged,
+                             "streamed": True, "clips": clips.get(sid, []) if sid else []})
     return {"root": str(root), "where": where, "subjects": subjects}
 
 
-DATA_TYPES = {".glb": "model/gltf-binary", ".sog": "application/zip", ".clip.zip": "application/zip"}
+DATA_TYPES = {".glb": "model/gltf-binary", ".sog": "application/zip", ".clip.zip": "application/zip",
+              ".json": "application/json", ".webp": "image/webp"}
 
 
 def data_type(p: Path) -> str:
@@ -130,9 +158,11 @@ def data_type(p: Path) -> str:
 
 
 def data_file(root: Path, rel: str) -> Path | None:
-    """The file /data/REL names, or None when REL leaves ROOT or is not a .glb, .sog or .clip.zip file."""
+    """The file /data/REL names, or None when REL leaves ROOT or is not a .glb, .sog or .clip.zip file, or a .json /
+    .webp file in a streamed web subject's <name>.lods/ folder."""
     p = (root / rel).resolve()
-    ok = p.suffix in (".glb", ".sog") or p.name.endswith(".clip.zip")
+    in_lods = any(q.suffix == ".lods" for q in p.parents if q.is_relative_to(root))
+    ok = p.suffix in (".glb", ".sog") or p.name.endswith(".clip.zip") or (in_lods and p.suffix in (".json", ".webp"))
     return p if p.is_relative_to(root) and p.is_file() and ok else None
 
 

@@ -20,6 +20,12 @@ the files read-only.
   and the rig) and its `.clip.zip` clips play like the glTF files. Any other SOG (b2csite's splats, splat-transform
   output) is shown as a plain splat, turned 180 degrees about z as PlayCanvas shows SOG files. Reading a `.sog` needs
   WebGL2 in a worker (OffscreenCanvas) to decode its WebP textures without premultiplying alpha.
+- **Streamed web subjects** (b2cgltf SPEC 10.3, `python -m b2cgltf.web subject-lods`): a `<name>.lods/` folder
+  (`lod-meta.json` + one SOG folder per LOD level + the shared `rig.glb`) is listed as `<subject>/<name>.lods` and
+  fetched one level at a time; a level fetched once is kept for later switches. It opens with Detail on auto. Served
+  only (serve.py), not opened from local files.
+- A file `b2cgltf.lod.strip_lods` made (its levels removed, `b2c_stripped`) opens like its source and plays its clips
+  (it keeps the `b2c_id`).
 - The selection is kept in the URL (`?subject=b24be4&clip=theater`), so links reopen the same view.
 - **Open files…** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) or dropping files onto the page views local files: a subject
   `.glb` or `.sog` and its `.clip.glb` or `.clip.zip` files, together or the clips later. They are read in the browser, not uploaded (the page
@@ -63,7 +69,10 @@ render settings (`B2CRIG_rig.render`).
 (`MSFT_lod` + `B2C_lod` / `B2CRIG_lod`), each labelled with its splat count and the largest on-screen height it is
 meant for (`maxScreenHeightPx`). A rigged level is posed by its own binding and plays the same clips; switching keeps
 the clip, the frame and the view. A chain that is stale (its `source` is not the base's) or broken is not offered, and
-the info line says why. The level is kept in the URL (`?lod=1`) and in the PNG's `lod`. The web form (.sog) has no levels.
+the info line says why. **auto** picks the coarsest level whose `maxScreenHeightPx` covers the subject's height on
+screen (device pixels), once the wanted level holds for 0.4 s, and drops to a coarser level only 15 % below its limit;
+a `.glb` opens at full detail and then switches. The level is kept in the URL (`?lod=1`, `?lod=auto`) and in the PNG's
+`lod`. A `.sog` holds one level (`web.subject --level`); a streamed web subject holds them all.
 
 ## How it works
 

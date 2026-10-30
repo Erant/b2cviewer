@@ -115,12 +115,17 @@ function nodeMatrix(nd) {   // column-major 4x4
 // level: the member of the current splat's LOD chain to show (0 = the current splat itself); the result's `lods` is
 // the chain (lodChain), `lodProblem` why a chain the file has is not used.
 // decode: WebP decoder for a .sog (sog.js's WebGL2 readback by default; a web subject has no LOD levels).
+// buf: the .glb or .sog bytes, or one level of a streamed web subject (b2cgltf SPEC 10.3), { files, lods, level }:
+// that level's SOG files (+ the shared rig.glb under the name its meta.json gives) and the chain from lod-meta.json.
 export async function parseSubject(buf, decode, level = 0) {
+  if (buf.files) return { ...await parseWebSubject(buf.files, decode), lods: buf.lods, lodProblem: null, level: buf.level };
   if (isZip(buf)) return { ...await parseWebSubject(await readZip(buf), decode), lods: null, lodProblem: null };
   const { json, acc } = readGlb(buf);
   const id = json.asset?.extras?.b2c_id;
   if (!id) throw new Error('not a b2c subject file (no asset.extras.b2c_id)');
-  if (json.asset.extras.b2c_stripped) throw new Error('this is a stripped distribution file (SPEC R8): it has no rig to play');
+  const stripped = json.asset.extras.b2c_stripped;   // b2cgltf lod.strip_lods only removes levels: the rig is whole
+  if (stripped && !(Array.isArray(stripped) && stripped.every(x => x?.what?.startsWith('LOD levels'))))
+    throw new Error('this is a stripped distribution file (SPEC R8): it has no rig to play');
   const rig = json.extensions?.[RIG];
   if (rig) version(rig, RIG);
 

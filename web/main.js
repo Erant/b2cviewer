@@ -20,6 +20,9 @@ const S = {
   orbit: null, timing: null, loading: false,
   extra: {},             // clips a host page added at run time: { [subject name]: [{ name, label, source }] }
   lightTarget: null,     // the point the light circles when it does not follow the body (glTF world)
+  lodAuto: false,        // Detail "auto": the level follows the subject's height on screen (maxScreenHeightPx)
+  lodPending: null,      // { level, t }: an auto switch waiting to hold steady
+  stream: null,          // a streamed web subject's lod-meta.json and fetched levels: { key, meta, levels, rig }
 };
 
 // ---------- status ----------
@@ -99,9 +102,14 @@ async function load(subject, clip, level = 0) {
   S.loading = true;
   setInputs(false);
   try {
-    const msg = { type: 'load', level }, transfer = [];
     const newSubject = subject.key !== S.loaded.subject;
-    if (newSubject) { msg.subject = await subject.get('subject'); transfer.push(msg.subject); }
+    if (level === 'auto')   // a .glb's chain is known once parsed: a new one opens at full detail, the check then switches
+      level = subject.streamed ? autoLevel((await streamMeta(subject)).lods, screenHeightPx(newSubject))
+        : newSubject ? 0 : autoLevel(S.info?.lods, screenHeightPx());
+    const msg = { type: 'load', level }, transfer = [];
+    if (subject.streamed) {   // the level's files are sent each time (copied: the page keeps them for the next switch)
+      if (newSubject || level !== S.loaded.level) { msg.web = await streamedLevel(subject, level); msg.newSubject = newSubject; }
+    } else if (newSubject) { msg.subject = await subject.get('subject'); transfer.push(msg.subject); }
     if (newSubject || (clip?.key ?? null) !== S.loaded.clip) {
       msg.clip = clip ? await clip.get('clip') : null;
       if (msg.clip) transfer.push(msg.clip);
@@ -145,18 +153,97 @@ async function load(subject, clip, level = 0) {
 
 function setInputs(on) { for (const id of ['subject', 'clip', 'lod']) $(id).disabled = !on; }
 
-// The current splat's LOD chain (SPEC 4.7, gltf.js lodChain): the row shows only when there are levels to pick.
+// The current splat's LOD chain (SPEC 4.7, gltf.js lodChain; a streamed web subject's lod-meta.json): the row shows
+// only when there are levels to pick. "auto" picks by the subject's height on screen.
 function fillLod(info) {
   const L = info.lods || [];
   document.body.classList.toggle('lod', L.length > 1);
-  fillSelect($('lod'), L.map((l, k) => ({ value: String(k), title: `node ${l.node}: ${l.name}`,
-    label: k ? `level ${k} · ${fmt(l.count)} splats · ≤ ${l.maxScreenHeightPx} px` : `full · ${fmt(l.count)} splats` })), String(info.level));
+  const items = L.map((l, k) => ({ value: String(k), title: l.node === null ? l.name : `node ${l.node}: ${l.name}`,
+    label: k ? `level ${k} · ${fmt(l.count)} splats · ≤ ${l.maxScreenHeightPx} px` : `full · ${fmt(l.count)} splats` }));
+  if (L.length > 1) items.unshift({ value: 'auto', label: `auto (level ${info.level})`,
+    title: 'the coarsest level meant for the subject\'s current height on screen (maxScreenHeightPx)' });
+  fillSelect($('lod'), items, S.lodAuto && L.length > 1 ? 'auto' : String(info.level));
+}
+
+// The subject's height on screen in device pixels: the body's (smoothed) height at its distance along the view. A new
+// subject (fresh: its orbit is about to be reset) fills 1 / 1.24 of the height (resetOrbit).
+function screenHeightPx(fresh = false) {
+  if (fresh || !S.bodies || !S.orbit) return canvas.height / 1.24;
+  const fr = Math.max(S.shown, 0), o = S.orbit, f = (canvas.height / 2) / Math.tan(+$('fov').value * Math.PI / 360);
+  const base = $('follow').checked ? bodyTarget(fr) : o.target, tgt = base.map((x, j) => x + o.pan[j]);
+  const az = o.az * Math.PI / 180, el = o.el * Math.PI / 180;
+  const back = [Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az)];
+  const pos = tgt.map((x, j) => x + o.dist * back[j]), c = bodyTarget(fr);
+  const depth = -[0, 1, 2].reduce((s, j) => s + (c[j] - pos[j]) * back[j], 0);
+  return depth > 0.05 ? f * S.bodies.size[1] / depth : Infinity;
+}
+
+// SPEC 4.7: the coarsest level whose maxScreenHeightPx still covers h (0 = the full splat).
+function autoLevel(lods, h) {
+  let k = 0;
+  (lods || []).forEach((l, j) => { if (j && l.maxScreenHeightPx >= h) k = j; });
+  return k;
+}
+
+// Auto detail: switch when the wanted level holds for 0.4 s; a coarser level only once the subject is 15 % below its
+// limit, so a zoom resting at a limit does not flip back and forth.
+function lodAutoCheck(t) {
+  const L = S.info?.lods;
+  if (!S.lodAuto || !L || L.length < 2 || S.loading) { S.lodPending = null; return; }
+  const h = screenHeightPx(), cur = S.info.level;
+  let want = autoLevel(L, h);
+  if (want > cur) want = Math.max(cur, autoLevel(L, h / 0.85));
+  if (want === cur) { S.lodPending = null; return; }
+  if (S.lodPending?.level !== want) { S.lodPending = { level: want, t }; return; }
+  if (t - S.lodPending.t > 400) { S.lodPending = null; loadSelection(want, true); }
+}
+
+// ---------- streamed web subjects (b2cgltf SPEC 10.3: <name>.lods/ = lod-meta.json + <level>_0/ SOG folders) ----------
+
+async function fetchJSON(u, label) { return JSON.parse(new TextDecoder().decode(await fetchBuf(u, label))); }
+
+async function streamMeta(src) {
+  if (S.stream?.key !== src.key) S.stream = { key: src.key, meta: null, levels: new Map(), rig: null };
+  const c = S.stream;
+  if (!c.meta) {
+    const m = await fetchJSON(`${src.streamed}/lod-meta.json`, 'lod-meta.json');
+    if (m.b2c?.version !== 1) throw new Error(`lod-meta.json: b2c version ${m.b2c?.version} (this viewer reads 1)`);
+    c.meta = m;
+    c.lods = m.b2c.levels.map((l, k) => ({ node: null, name: m.filenames[k].split('/')[0], count: l.count, maxScreenHeightPx: l.maxScreenHeightPx }));
+  }
+  return c;
+}
+
+// one level's files, named as its meta.json names them (the shared rig.glb too), for gltf.js parseSubject
+async function streamedLevel(src, level) {
+  const c = await streamMeta(src);
+  if (!c.lods[level]) level = 0;
+  if (!c.levels.has(level)) {
+    const dir = c.meta.filenames[level].replace(/meta\.json$/, ''), label = `level ${level}`;
+    const metaBuf = new Uint8Array(await fetchBuf(`${src.streamed}/${dir}meta.json`, label));
+    const meta = JSON.parse(new TextDecoder().decode(metaBuf)), names = new Set();
+    const walk = o => { if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) {
+      if (k === 'files' && Array.isArray(v)) v.forEach(x => names.add(x));
+      else if (k === 'file' && typeof v === 'string') names.add(v);
+      else walk(v);
+    } };
+    walk(meta);
+    const files = new Map([['meta.json', metaBuf]]);
+    for (const n of names) files.set(n, new Uint8Array(await fetchBuf(`${src.streamed}/${dir}${n}`, `${label}: ${n}`)));
+    if (meta.b2c?.rig) {
+      c.rig ??= new Uint8Array(await fetchBuf(new URL(meta.b2c.rig, new URL(`${src.streamed}/${dir}`, location.href)).href, 'rig.glb'));
+      files.set(meta.b2c.rig, c.rig);
+    }
+    c.levels.set(level, files);
+  }
+  return { files: c.levels.get(level), lods: c.lods, level };
 }
 
 // ---------- subjects and clips ----------
 
 const url = p => `data/${p.split('/').map(encodeURIComponent).join('/')}`;
 const served = p => ({ key: p, get: label => fetchBuf(url(p), label) });
+const servedStream = p => ({ key: p, streamed: url(p) });   // a <name>.lods/ folder: fetched level by level
 
 // { name, subject: source, clips: [{ name, label, source }] } for the selected entry
 function entryOf(name = $('subject').value) {
@@ -167,7 +254,7 @@ function entryOf(name = $('subject').value) {
 function baseEntryOf(name) {
   if (name === '(dropped)' && S.dropped) return { name, subject: S.dropped.subject, clips: S.dropped.clips.map(c => ({ name: c.name, label: c.name, source: c })) };
   const s = S.index?.subjects.find(x => x.name === name);
-  return s && { name: s.name, path: s.path, subject: served(s.path),
+  return s && { name: s.name, path: s.path, subject: s.streamed ? servedStream(s.path) : served(s.path),
     clips: s.clips.map(c => ({ name: c.name, label: `${c.name} · ${c.frames}f`, path: c.path, source: served(c.path) })) };
 }
 
@@ -215,10 +302,17 @@ function swapAB() {
   loadSelection();
 }
 
-function loadSelection(level = +$('lod').value || 0) {
+const lodChoice = () => $('lod').value === 'auto' ? 'auto' : +$('lod').value || 0;
+// a subject's first level: auto for a streamed web subject (fetching less is its point), else the full splat
+const defaultLod = () => entryOf()?.subject.streamed ? 'auto' : 0;
+
+// level: a LOD level, or 'auto' (by the subject's height on screen); auto: the level is auto's pick (lodAutoCheck)
+function loadSelection(level = lodChoice(), auto = level === 'auto') {
   const e = entryOf(); if (!e) return;
+  S.lodAuto = auto;
   const clip = e.clips.find(c => c.name === $('clip').value);
-  if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '', ...level ? { lod: level } : {} })}`);
+  const lod = auto ? 'auto' : level;
+  if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '', ...lod ? { lod } : {} })}`);
   else history.replaceState(null, '', location.pathname);
   lightURL();
   updateAB();
@@ -241,10 +335,10 @@ async function init() {
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
   status(`${subs.length} subjects (${rigged.length} rigged) under ${S.index.root}`);
-  loadSelection(+q.get('lod') || 0);
+  loadSelection(q.get('lod') === 'auto' ? 'auto' : q.has('lod') ? +q.get('lod') || 0 : defaultLod());
 }
 
-$('subject').onchange = () => { fillClips(); loadSelection(0); };
+$('subject').onchange = () => { fillClips(); loadSelection(defaultLod()); };
 $('lod').onchange = () => loadSelection();
 
 // A host page (b2canimate) adds clips it produced: `buf` is a .clip.glb or .clip.zip ArrayBuffer for `subject` (an
@@ -252,7 +346,7 @@ $('lod').onchange = () => loadSelection();
 window.b2cviewerHost = {
   get subject() { return $('subject').value; },
   get clip() { return $('clip').value; },
-  get level() { return S.info?.level ?? 0; },   // the LOD level shown (0 = the full splat)
+  get level() { return S.info?.level ?? 0; },   // the LOD level shown (0 = the full splat), auto or picked
   get rigged() { return !!S.info?.rigged; },
   get index() { return S.index; },
   // the subject opened from this computer ('(dropped)'): { name, key, buf } or null
@@ -691,6 +785,7 @@ function tick(t) {
     renderer.render(cam, renderOpts());
     updateLightDot(cam);
   }
+  lodAutoCheck(t);
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);

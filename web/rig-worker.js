@@ -1,6 +1,7 @@
 // Worker: parses the subject and clip files (gltf.js), and per request poses a clip frame's cage, builds the face
 // texture and a back-to-front splat order for the current camera. Without a clip it shows the rest pose; an unrigged
-// subject is shown as delivered. Another LOD level of the same subject re-parses the kept subject file and keeps the clip.
+// subject is shown as delivered. Another LOD level of the same subject re-parses the kept subject file (or parses the
+// level the page fetched, for a streamed web subject) and keeps the clip.
 import { parseSubject, parseClip, poseCage } from './gltf.js';
 import { Rig } from './rig.js';
 
@@ -38,10 +39,12 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
       const t0 = performance.now(), msg = { type: 'loaded' }, transfer = [];
-      if (m.subject || (subject && (m.level ?? 0) !== subject.level)) {
-        progress(m.subject ? 'parsing the subject file' : `parsing LOD level ${m.level}`, 0);
-        const parsed = await parseSubject(m.subject ?? subjectBuf, undefined, m.level ?? 0);
+      // m.web: one level of a streamed web subject (fetched by the page); a new subject drops the clip, a level keeps it
+      if (m.subject || m.web || (subjectBuf && (m.level ?? 0) !== subject.level)) {
+        progress(m.subject || m.newSubject ? 'parsing the subject file' : `parsing LOD level ${m.level}`, 0);
+        const parsed = await parseSubject(m.web ?? m.subject ?? subjectBuf, undefined, m.level ?? 0);
         if (m.subject) { subjectBuf = m.subject; clip = null; }
+        if (m.web) { subjectBuf = null; if (m.newSubject) clip = null; }
         subject = parsed;
         rig = new Rig(subject.splat, subject.binding, subject.cage, subject.skeleton);
         const tex = rig.splatTexels(), sh = rig.shTexels();
