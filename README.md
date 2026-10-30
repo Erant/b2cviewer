@@ -42,6 +42,18 @@ page's own requests are relative (`api/index`, `data/…`) so it works under suc
 | <kbd>F</kbd> | follow the body (the orbit target tracks the smoothed body centroid) |
 | <kbd>B</kbd> or **⇄** | swap the clip with its A/B partner, `CLIP` ⇄ `CLIP_fix`, at the same frame and view (a badge in the corner says which one is showing) |
 | <kbd>S</kbd> or **⤓ PNG** | save the view as `b2cview_<subject>_<clip>_f<frame>_<time>.png` (Firefox: to Downloads). A `tEXt` chunk `b2cviewer` holds JSON: the subject and clip files, the frame, the render options and the camera as a b2crig cameras.json entry in the b2crunner frame; b2crig's `tools/viewer_shot.py` re-renders exactly that view with b2ctrain |
+| <kbd>L</kbd> + drag | move the light (relighting on); dragging its dot does the same |
+
+**Lighting** (experimental, viewer only): *Show* relit, the normals (glTF world as RGB) or the lighting alone on grey.
+The captured colour is taken as albedo under an even light; it is multiplied by a hemisphere ambient (sky / ground
+colours) plus one point, spot or sun light (power, colour temperature and tint, azimuth / elevation / distance around
+the body, range, cone), with a wrap term, an optional Blinn-Phong specular, exposure and a soft highlight shoulder.
+The light casts shadows of the posed cage (*Shadows*: strength, softness, bias; rigged subjects only).
+Drag the light's dot (a hollow dot at the edge when it is off screen; faded when behind the body), or hold <kbd>L</kbd>
+and drag anywhere, to move it over the sphere of its distance; scroll over the dot for the distance. The light follows
+the body or stays put, and can move with the camera. The settings are kept in the URL (`?light=` JSON of the
+non-default values) and in the PNG's `lighting`. With *ambient* 1, no light and no shoulder the relit view is the
+captured one.
 
 Also in the panel: the stretch fade (`--cage-fade-start/--cage-fade-end`), the max triangle growth
 (`--cage-max-growth`), the SH degree and the background colour. The growth and fade start from the subject file's
@@ -62,6 +74,15 @@ It mirrors `b2ctrain render --cage CAGE --cage-max-growth 1.15`:
 - `web/rig.js` ports `gpu/cage.cu`'s posing: per frame it builds the posed triangle frames (with the growth clamp) and
   the posed splat centres.
 - `web/rig-worker.js` runs the parsing, posing and depth sorting off the UI thread.
+- `web/light.js` and `relight` in `web/renderer.js`: the relighting. Each splat's normal is the posed cage's
+  (area-weighted vertex normals per frame, `Rig.frame`, interpolated with the splat's barycentrics) turned towards
+  the splat's own shortest axis as far as the splat is flat (*Normals* slider). Splats without a cage face use their
+  shortest axis, facing the camera; a normal facing away from the camera is reflected into the visible half (the cage
+  has surfaces that face away, e.g. inside the mouth). Shadows: per frame the posed cage's triangles (from the face
+  texture) go into a 2048² map of linear depth from the light, framed on the body's bounding sphere (perspective; a
+  sun's orthographic). A bound splat looks its shadow up at its anchor on its cage triangle, so splats a little
+  inside or outside the cage take the surface's shadow; a slope-scaled bias and a normal offset keep surfaces at a
+  grazing angle from shadowing themselves, and 12 taps on a disc soften the edge.
 - `web/renderer.js` poses every splat in the vertex shader from a per-face texture (`pose_bound` and the stretch
   fade), evaluates SH in the triangle's canonical frame and projects like b2ctrain's rasteriser (EWA, 0.3 px blur,
   1/255 cutoff). It blends into a half-float target.

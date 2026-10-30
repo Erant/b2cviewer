@@ -3,6 +3,8 @@
 // does (EWA, 0.3 px blur, alpha from the 1/255 contour).
 import { SPLAT_TEXELS, FACE_TEXELS } from './rig.js';
 
+export const MAX_LIGHTS = 4;
+
 const VS = `#version 300 es
 precision highp float;
 precision highp int;
@@ -12,6 +14,7 @@ layout(location = 0) in vec2 aCorner;
 layout(location = 1) in uint aIndex;
 
 uniform sampler2D uSplat, uSH, uFace;
+uniform highp sampler2D uShadow;   // light 0's shadow map: linear depth (m) of the posed cage along uLFwd
 uniform ivec3 uRows;      // items per texture row: splat, sh, face
 uniform int uShPer, uDegree;
 uniform vec2 uFade;       // stretch fade start, end (0 = off)
@@ -21,6 +24,22 @@ uniform vec3 uViewT, uCamPos;
 uniform vec4 uIntr;       // fx, fy, cx, cy (pixels)
 uniform vec4 uLim;        // EWA Jacobian clamp: pos x, pos y, neg x, neg y
 uniform vec2 uViewport;
+uniform int uLightView;   // relighting (light.js): 0 off, 1 lit, 2 normals, 3 lighting on grey
+uniform float uNormalMix; // how far flat splats trust their own shortest axis over the cage normal
+uniform mat3 uWR;         // b2crunner frame -> glTF world (the normals view's colours)
+uniform vec3 uSky, uGround, uUp;   // hemisphere ambient (already times its intensity), world up (b2crunner frame)
+uniform vec4 uShade;      // wrap, exposure, specular strength, shininess
+uniform ivec3 uShadeOpt;  // linear (gamma 2.2) lighting, soft shoulder, relight the DC only (the view-dependent rest as captured)
+uniform int uNLights;
+uniform vec4 uLPos[${MAX_LIGHTS}];    // xyz position (w = 1) or direction the light travels (w = 0)
+uniform vec4 uLCol[${MAX_LIGHTS}];    // rgb colour x intensity, range (0 = none)
+uniform vec4 uLSpot[${MAX_LIGHTS}];   // xyz spot axis, cos(outer cone) (-2 = no cone)
+uniform float uLSoft[${MAX_LIGHTS}];  // cos(inner cone)
+uniform int uShadowOn;
+uniform mat4 uLVP;        // b2crunner frame -> light 0's shadow clip space
+uniform vec3 uLEye, uLFwd;
+uniform vec4 uShadowP;    // bias (m), softness (texels), strength, map size
+uniform vec2 uShadowT;    // a texel's width in metres: x (sun), or x times the depth (point, spot); y 1 for the sun
 
 out vec4 vColor;
 out vec3 vConic;
@@ -45,6 +64,56 @@ mat3 qmat(vec4 q) {           // columns of the rotation matrix of a (w, x, y, z
 float tanh_(float x) { float t = exp(-2. * abs(x)); return sign(x) * (1. - t) / (1. + t); }
 vec3 tanh3(vec3 x) { return vec3(tanh_(x.x), tanh_(x.y), tanh_(x.z)); }
 
+// Light 0's visibility at p (normal n, towards the light l): soft (12 taps on a disc) comparison against the cage's
+// depth map; 1 outside the map. The bias grows with the slope of the surface to the light across the taps' disc (a
+// surface at a grazing angle would shadow itself), and the lookup moves off the surface along n by two texels.
+float shadow(vec3 p, vec3 n, vec3 l) {
+  float tex = uShadowT.x * (uShadowT.y > 0.5 ? 1. : max(dot(p - uLEye, uLFwd), 0.01));
+  float cs = clamp(abs(dot(n, l)), 0.05, 1.), slope = min((uShadowP.y + 1.) * tex * sqrt(1. - cs * cs) / cs, 0.1);
+  p += n * 2. * tex;
+  vec4 c = uLVP * vec4(p, 1.);
+  vec2 uv = c.xy / c.w * 0.5 + 0.5;
+  if (c.w <= 0. || any(lessThan(uv, vec2(0.))) || any(greaterThan(uv, vec2(1.)))) return 1.;
+  float d = dot(p - uLEye, uLFwd) - uShadowP.x - slope, sz = uShadowP.w, lit = 0.;
+  vec2 px = uv * sz;
+  for (int k = 0; k < 12; k++) {
+    float a = float(k) * 2.39996, r = sqrt((float(k) + 0.5) / 12.) * uShadowP.y;   // golden-angle spiral
+    ivec2 t = clamp(ivec2(px + r * vec2(cos(a), sin(a))), ivec2(0), ivec2(sz - 1.));
+    lit += d <= texelFetch(uShadow, t, 0).r ? 1. : 0.;
+  }
+  return mix(1., lit / 12., uShadowP.z);
+}
+
+// Relit colour of a splat whose captured colour (base) is taken as albedo x an even light of 1. The shadow is looked
+// up at the splat's anchor on its cage triangle (normal na): a splat a little inside or outside the cage takes the
+// shadow of the surface it belongs to instead of being shadowed by it.
+vec3 relight(vec3 base, vec3 pos, vec3 n, vec3 anchor, vec3 na) {
+  vec3 alb = uShadeOpt.x == 1 ? pow(max(base, 0.), vec3(2.2)) : base;
+  vec3 E = mix(uGround, uSky, dot(n, uUp) * 0.5 + 0.5), spec = vec3(0.);
+  vec3 v = normalize(uCamPos - pos);
+  for (int j = 0; j < ${MAX_LIGHTS}; j++) {
+    if (j >= uNLights) break;
+    vec3 l; float att = 1.;
+    if (uLPos[j].w > 0.) {
+      vec3 dl = uLPos[j].xyz - pos; float d2 = max(dot(dl, dl), 1e-4);
+      l = dl * inversesqrt(d2);
+      att = 1. / d2;
+      if (uLCol[j].w > 0.) { float r = d2 / (uLCol[j].w * uLCol[j].w); att *= clamp(1. - r * r, 0., 1.); }   // smooth range window
+      if (uLSpot[j].w > -1.5) att *= smoothstep(uLSpot[j].w, uLSoft[j], dot(-l, uLSpot[j].xyz));
+    } else l = -uLPos[j].xyz;
+    float nl = dot(n, l), w = uShade.x;
+    if (j == 0 && uShadowOn == 1 && nl > -w) att *= shadow(anchor, na, l);
+    E += uLCol[j].rgb * att * max((nl + w) / (1. + w), 0.);
+    if (uShade.z > 0. && nl > 0.) spec += uLCol[j].rgb * att * uShade.z * pow(max(dot(n, normalize(l + v)), 0.), uShade.w);
+  }
+  vec3 c = (alb * E + spec) * uShade.y;
+  if (uShadeOpt.y == 1) {   // soft shoulder above 0.8: keeps the range below, rolls highlights off towards 1
+    vec3 k = vec3(0.8);
+    c = mix(c, k + 0.2 * (1. - exp(-(c - k) / 0.2)), step(k, c));
+  }
+  return uShadeOpt.x == 1 ? pow(max(c, 0.), vec3(1. / 2.2)) : c;
+}
+
 void cull() { gl_Position = vec4(0., 0., 2., 1.); }
 
 void main() {
@@ -53,6 +122,7 @@ void main() {
   vec4 t2 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 2);
   vec3 pos = t0.xyz; float op = t0.w; vec4 q = t1; vec3 ls = t2.xyz; int f = int(t2.w);
   vec4 shf = vec4(1., 0., 0., 0.);
+  vec3 nCage = vec3(0.), anchor = pos;
   if (f >= 0) {
     vec4 t3 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 3), t4 = fetch(uSplat, i, ${SPLAT_TEXELS}, uRows.x, 4);
     float b1 = t3.w, b2 = t4.x, w0 = 1. - b1 - b2;
@@ -61,7 +131,8 @@ void main() {
     vec4 dq = fetch(uFace, f, ${FACE_TEXELS}, uRows.z, 6);
     float k = R0.w, k0 = R1.w, ratio = R2.w;
     vec3 off = t3.xyz;
-    pos = A.xyz * w0 + B.xyz * b1 + C.xyz * b2 + vec3(dot(R0.xyz, off), dot(R1.xyz, off), dot(R2.xyz, off)) * k;
+    anchor = A.xyz * w0 + B.xyz * b1 + C.xyz * b2;
+    pos = anchor + vec3(dot(R0.xyz, off), dot(R1.xyz, off), dot(R2.xyz, off)) * k;
     if (uFade.x > 0. && uFade.y > uFade.x) {   // stretch fade: opacity -> 0 as the triangle grows from start to end
       float fa = clamp((uFade.y - ratio) / (uFade.y - uFade.x), 0., 1.);
       if (fa < 1.) { float sg = clamp(fa / (1. + exp(-op)), 1e-6, 1. - 1e-6); op = log(sg / (1. - sg)); }
@@ -69,6 +140,11 @@ void main() {
     q = qmul(dq, q);
     ls += (k0 > 0. && k > 0.) ? log(k / k0) : 0.;
     shf = dq;
+    if (uLightView > 0) {
+      vec3 na = fetch(uFace, f, ${FACE_TEXELS}, uRows.z, 7).xyz, nb = fetch(uFace, f, ${FACE_TEXELS}, uRows.z, 8).xyz, nc = fetch(uFace, f, ${FACE_TEXELS}, uRows.z, 9).xyz;
+      nCage = na * w0 + nb * b1 + nc * b2;
+      nCage = dot(nCage, nCage) > 1e-8 ? normalize(nCage) : vec3(R0.z, R1.z, R2.z);
+    }
   }
 
   // projection (splat_math.cuh project_one)
@@ -118,6 +194,29 @@ void main() {
     }
   }
   col += 0.5;
+  if (uLightView > 0) {
+    // the normal: the cage's (smooth, posed), turned towards the splat's own shortest axis as far as the splat is flat
+    mat3 Q = qmat(q);
+    int ax = ls.x <= ls.y && ls.x <= ls.z ? 0 : ls.y <= ls.z ? 1 : 2;
+    vec3 nS = Q[ax];
+    float lmin = ls[ax], lmid = ax == 0 ? min(ls.y, ls.z) : ax == 1 ? min(ls.x, ls.z) : min(ls.x, ls.y);
+    float flat_ = 1. - exp(lmin - lmid);
+    vec3 n;
+    if (f >= 0) n = normalize(mix(nCage, nS * sign(dot(nS, nCage) + 1e-6), flat_ * uNormalMix));
+    else n = nS * sign(dot(nS, uCamPos - pos) + 1e-6);   // no cage: the splat's own axis, facing the camera (the visible side)
+    // a splat that is seen cannot face away: the cage has surfaces that do (inside the mouth, stray triangles), and
+    // without shadows a light behind would reach them. Reflect the normal into the visible half (rims keep their side).
+    vec3 vd = normalize(uCamPos - pos);
+    float nv = dot(n, vd);
+    if (nv < 0.) n -= 2. * nv * vd;
+    if (uLightView == 2) col = uWR * n * 0.5 + 0.5;
+    else {
+      vec3 na = f >= 0 ? nCage : n;
+      if (uLightView == 3) col = relight(vec3(0.5), pos, n, anchor, na);
+      else if (uShadeOpt.z == 1) { vec3 dc = max(SH(0) * 0.28209479 + 0.5, 0.); col = relight(dc, pos, n, anchor, na) + (col - dc); }
+      else col = relight(col, pos, n, anchor, na);
+    }
+  }
   vColor = vec4(max(col, 0.), opac);   // raster_fwd.cu composites max(colour, 0)
 
   vD = aCorner * ext;
@@ -138,6 +237,30 @@ void main() {
   if (a < 1. / 255.) discard;
   fragColor = vec4(vColor.rgb * a, a);
 }`;
+
+// The posed cage (from the face texture: corners a, b, c of face gl_VertexID / 3) into light 0's shadow map, as the
+// linear depth along the light's axis.
+const SHADOW_VS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+uniform sampler2D uFace;
+uniform int uRowsF;
+uniform mat4 uLVP;
+uniform vec3 uLEye, uLFwd;
+out float vDepth;
+void main() {
+  int f = gl_VertexID / 3, k = gl_VertexID % 3;
+  vec3 p = texelFetch(uFace, ivec2((f % uRowsF) * ${FACE_TEXELS} + k, f / uRowsF), 0).xyz;
+  vDepth = dot(p - uLEye, uLFwd);
+  gl_Position = uLVP * vec4(p, 1.);
+}`;
+const SHADOW_FS = `#version 300 es
+precision highp float;
+in float vDepth;
+out vec4 fragColor;
+void main() { fragColor = vec4(vDepth, 0., 0., 1.); }`;
+export const SHADOW_SIZE = 2048;
 
 // Resolve the float framebuffer onto the canvas (clamped, over the background).
 const BLIT_VS = `#version 300 es
@@ -180,6 +303,8 @@ export class Renderer {
     this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     this.prog = compile(gl, VS, FS);
     this.blit = compile(gl, BLIT_VS, BLIT_FS);
+    this.shadowProg = compile(gl, SHADOW_VS, SHADOW_FS);
+    this.shadowMap = null;
     this.vao = gl.createVertexArray();
     gl.bindVertexArray(this.vao);
     const quad = gl.createBuffer();
@@ -226,7 +351,42 @@ export class Renderer {
 
   setSplats(splatTex, n) { this.n = n; this.rows = this.rows || [1, 1, 1]; this.rows[0] = this._texture('splat', splatTex, n, SPLAT_TEXELS, 0); }
   setSH(sh, n, degree) { this.shPer = sh.per; this.degree = degree; this.rows[1] = this._texture('sh', sh.data, n, sh.per, 1); }
-  setFace(face, nf) { this.rows[2] = this._texture('face', face, nf, FACE_TEXELS, 2); }
+  setFace(face, nf) { this.nf = nf; this.rows[2] = this._texture('face', face, nf, FACE_TEXELS, 2); }
+
+  // Light 0's shadow map of the posed cage. sh: { vp (column-major 4x4), eye, fwd }
+  _shadowPass(sh) {
+    const gl = this.gl, N = SHADOW_SIZE;
+    if (!this.shadowMap) {
+      const t = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE5);
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R32F, N, N);
+      for (const p of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, p, gl.NEAREST);
+      const depth = gl.createRenderbuffer();
+      gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, N, N);
+      const fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+      this.shadowMap = { t, fbo };
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.shadowMap.fbo);
+    gl.viewport(0, 0, N, N);
+    gl.clearBufferfv(gl.COLOR, 0, [1e9, 0, 0, 1]);
+    gl.clearBufferfi(gl.DEPTH_STENCIL, 0, 1, 0);
+    const { p, u } = this.shadowProg;
+    gl.useProgram(p);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, this.tex.face.t);
+    gl.uniform1i(u.uFace, 2); gl.uniform1i(u.uRowsF, this.rows[2]);
+    gl.uniformMatrix4fv(u.uLVP, false, sh.vp);
+    gl.uniform3f(u.uLEye, ...sh.eye); gl.uniform3f(u.uLFwd, ...sh.fwd);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+    gl.bindVertexArray(this.vao);   // attributes unused: the corners come from gl_VertexID
+    gl.drawArrays(gl.TRIANGLES, 0, this.nf * 3);
+    gl.bindVertexArray(null);
+    gl.disable(gl.DEPTH_TEST);
+  }
   setOrder(order) {
     const gl = this.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, this.orderBuf);
@@ -252,6 +412,8 @@ export class Renderer {
   // cam: { R (row-major world -> camera, OpenCV), t, pos, fx, fy, cx, cy }; opts: { fade, crease, creaseFade, degree, bg }
   render(cam, opts) {
     const gl = this.gl, W = this.canvas.width, H = this.canvas.height;
+    const shadowOn = !!(opts.light?.view && opts.light.shadow && this.count && this.tex.face && this.nf);
+    if (shadowOn) this._shadowPass(opts.light.shadow);
     this._target(W, H);
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
     gl.viewport(0, 0, W, H);
@@ -274,6 +436,28 @@ export class Renderer {
       gl.uniform4f(u.uIntr, cam.fx, cam.fy, cam.cx, cam.cy);
       gl.uniform4f(u.uLim, (1.15 * W - cam.cx) / cam.fx, (1.15 * H - cam.cy) / cam.fy, (-0.15 * W - cam.cx) / cam.fx, (-0.15 * H - cam.cy) / cam.fy);
       gl.uniform2f(u.uViewport, W, H);
+      const L = opts.light || { view: 0 };
+      gl.uniform1i(u.uLightView, L.view);
+      if (L.view) {
+        gl.uniform1f(u.uNormalMix, L.normalMix);
+        gl.uniformMatrix3fv(u.uWR, false, L.WR);
+        gl.uniform3f(u.uSky, ...L.sky); gl.uniform3f(u.uGround, ...L.ground); gl.uniform3f(u.uUp, ...L.up);
+        gl.uniform4f(u.uShade, L.wrap, L.exposure, L.spec, L.shininess);
+        gl.uniform3i(u.uShadeOpt, L.linear ? 1 : 0, L.shoulder ? 1 : 0, L.dcOnly ? 1 : 0);
+        const ls = L.lights.slice(0, MAX_LIGHTS), pad = (k, m) => { const a = new Float32Array(MAX_LIGHTS * m); ls.forEach((x, j) => a.set(x[k], j * m)); return a; };
+        gl.uniform1i(u.uNLights, ls.length);
+        gl.uniform4fv(u['uLPos[0]'], pad('pos', 4)); gl.uniform4fv(u['uLCol[0]'], pad('col', 4));
+        gl.uniform4fv(u['uLSpot[0]'], pad('spot', 4)); gl.uniform1fv(u['uLSoft[0]'], pad('soft', 1));
+        gl.uniform1i(u.uShadowOn, shadowOn && ls.length ? 1 : 0);
+        if (shadowOn) {
+          const sh = L.shadow;
+          gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, this.shadowMap.t); gl.uniform1i(u.uShadow, 5);
+          gl.uniformMatrix4fv(u.uLVP, false, sh.vp);
+          gl.uniform3f(u.uLEye, ...sh.eye); gl.uniform3f(u.uLFwd, ...sh.fwd);
+          gl.uniform4f(u.uShadowP, sh.bias, sh.soft, sh.strength, SHADOW_SIZE);
+          gl.uniform2f(u.uShadowT, sh.texel / SHADOW_SIZE, sh.ortho ? 1 : 0);
+        }
+      }
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // premultiplied, back to front
       gl.bindVertexArray(this.vao);

@@ -6,7 +6,7 @@
 import { creaseValues } from './crease.js';
 
 export const SPLAT_TEXELS = 5;   // t0 pos.xyz op | t1 quat wxyz | t2 lscale.xyz face | t3 off.xyz b1 | t4 b2 crease
-export const FACE_TEXELS = 7;    // a.xyz | b.xyz | c.xyz | R row0, k | R row1, k0 | R row2, ratio | dq wxyz
+export const FACE_TEXELS = 10;   // a.xyz | b.xyz | c.xyz | R row0, k | R row1, k0 | R row2, ratio | dq wxyz | na | nb | nc (vertex normals)
 
 // Triangle frame (cage.cu tri_frame): R row-major with columns (e1, e2, n); returns k = sqrt(2 area), 0 when degenerate.
 function triFrame(V, ia, ib, ic, R) {
@@ -86,6 +86,19 @@ export class Rig {
     if (!this.cage) return { face: new Float32Array(FACE_TEXELS * 4), centres: this.splat.pos.slice() };   // one unused face
     const { nf, faces } = this.cage, { k0, q0 } = this;
     const face = new Float32Array(nf * FACE_TEXELS * 4), R = new Float64Array(9), q = new Float64Array(4);
+    // area-weighted vertex normals of the posed cage (the relighting's smooth normals; each layer has its own vertices)
+    const nrm = new Float32Array(this.cage.nv * 3);
+    for (let f = 0; f < nf; f++) {
+      const a = faces[f * 3] * 3, b = faces[f * 3 + 1] * 3, c = faces[f * 3 + 2] * 3;
+      const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2];
+      const wx = V[c] - V[a], wy = V[c + 1] - V[a + 1], wz = V[c + 2] - V[a + 2];
+      const nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+      for (const v of [a, b, c]) { nrm[v] += nx; nrm[v + 1] += ny; nrm[v + 2] += nz; }
+    }
+    for (let v = 0; v < nrm.length; v += 3) {
+      const l = Math.hypot(nrm[v], nrm[v + 1], nrm[v + 2]) || 1;
+      nrm[v] /= l; nrm[v + 1] /= l; nrm[v + 2] /= l;
+    }
     for (let f = 0; f < nf; f++) {
       const ia = faces[f * 3], ib = faces[f * 3 + 1], ic = faces[f * 3 + 2], o = f * FACE_TEXELS * 4;
       face[o] = V[ia * 3]; face[o + 1] = V[ia * 3 + 1]; face[o + 2] = V[ia * 3 + 2];
@@ -105,6 +118,7 @@ export class Rig {
       face[o + 25] = aw * bx + ax * bw + ay * bz - az * by;
       face[o + 26] = aw * by - ax * bz + ay * bw + az * bx;
       face[o + 27] = aw * bz + ax * by - ay * bx + az * bw;
+      face.set(nrm.subarray(ia * 3, ia * 3 + 3), o + 28); face.set(nrm.subarray(ib * 3, ib * 3 + 3), o + 32); face.set(nrm.subarray(ic * 3, ic * 3 + 3), o + 36);
     }
     // posed centres (pose_bound)
     const { n, pos } = this.splat, { bindF, bindB, bindOff } = this, centres = new Float32Array(n * 3);

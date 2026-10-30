@@ -1,6 +1,7 @@
 // b2cviewer UI: picks a subject file and (once rigged) one of its clip files from serve.py's index (or dropped local files),
 // plays the clip, and drives the rig worker (posing, sorting) and the renderer.
 import { Renderer } from './renderer.js';
+import { kelvinRGB, hexRGB, placeLight, shadowFrustum } from './light.js';
 
 const $ = id => document.getElementById(id);
 const canvas = $('canvas');
@@ -17,6 +18,8 @@ const S = {
   frame: 0, shown: -1, playing: false, playT0: 0,
   ready: false, busy: false, needFrame: false, needSort: false, dirty: true,
   orbit: null, timing: null, loading: false,
+  extra: {},             // clips a host page added at run time: { [subject name]: [{ name, label, source }] }
+  lightTarget: null,     // the point the light circles when it does not follow the body (glTF world)
 };
 
 // ---------- status ----------
@@ -145,6 +148,11 @@ const served = p => ({ key: p, get: label => fetchBuf(url(p), label) });
 
 // { name, subject: source, clips: [{ name, label, source }] } for the selected entry
 function entryOf(name = $('subject').value) {
+  const e = baseEntryOf(name);
+  if (e && S.extra[name]) e.clips = [...e.clips, ...S.extra[name]];
+  return e;
+}
+function baseEntryOf(name) {
   if (name === '(dropped)' && S.dropped) return { name, subject: S.dropped.subject, clips: S.dropped.clips.map(c => ({ name: c.name, label: c.name, source: c })) };
   const s = S.index?.subjects.find(x => x.name === name);
   return s && { name: s.name, path: s.path, subject: served(s.path),
@@ -200,8 +208,9 @@ function loadSelection() {
   const clip = e.clips.find(c => c.name === $('clip').value);
   if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '' })}`);
   else history.replaceState(null, '', location.pathname);
+  lightURL();
   updateAB();
-  load(e.subject, clip?.source ?? null);
+  load(e.subject, clip?.source ?? null).finally(() => window.dispatchEvent(new Event('b2cviewer:change')));
 }
 
 async function init() {
@@ -216,6 +225,7 @@ async function init() {
   const q = new URLSearchParams(location.search);
   if (+q.get('crease') > 0) { $('crease').checked = true; $('creaseR').value = +q.get('crease'); }   // ?crease=0.04&creasefade=0.02
   if (q.has('creasefade')) $('creaseW').value = +q.get('creasefade');
+  if (q.has('light')) try { setLightPanel(JSON.parse(q.get('light'))); } catch { status('?light= is not JSON; ignored', true); }
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
   status(`${subs.length} subjects (${rigged.length} rigged) under ${S.index.root}`);
@@ -223,6 +233,23 @@ async function init() {
 }
 
 $('subject').onchange = () => { fillClips(); loadSelection(); };
+
+// A host page (b2canimate) adds clips it produced: `buf` is a .clip.glb or .clip.zip ArrayBuffer for `subject` (an
+// entry name in the subject list). The clip is listed beside the subject's own and selected when that subject shows.
+window.b2cviewerHost = {
+  get subject() { return $('subject').value; },
+  get clip() { return $('clip').value; },
+  get rigged() { return !!S.info?.rigged; },
+  get index() { return S.index; },
+  // the subject opened from this computer ('(dropped)'): { name, key, buf } or null
+  async droppedSubject() { const d = S.dropped?.subject; return d && { name: d.name, key: d.key, buf: await d.get('subject') }; },
+  addClip(subject, name, buf, label = name) {
+    const key = `added:${subject}:${name}:${buf.byteLength}`;
+    const source = { key, get: async () => buf.slice(0) };
+    S.extra[subject] = [...(S.extra[subject] || []).filter(c => c.name !== name), { name, label, source }];
+    if ($('subject').value === subject) { fillClips(name); loadSelection(); }
+  },
+};
 $('clip').onchange = () => loadSelection();
 $('abSwap').onclick = swapAB;
 
@@ -321,9 +348,12 @@ function sortView(fr) {
 let drag = null;
 canvas.addEventListener('pointerdown', e => {
   canvas.setPointerCapture(e.pointerId);
-  drag = { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey || e.button === 1 };
+  drag = S.keyL && +$('lightView').value && +$('lightType').value ? lightDragStart(e)
+    : { x: e.clientX, y: e.clientY, pan: e.button === 2 || e.shiftKey || e.button === 1 };
+  if (drag.light) lightDragTo(e, drag.far);
 });
 canvas.addEventListener('pointermove', e => {
+  if (drag?.light) { lightDragTo(e, drag.far); return; }
   if (!drag || !S.orbit) return;
   const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
   drag.x = e.clientX; drag.y = e.clientY;
@@ -338,7 +368,7 @@ canvas.addEventListener('pointermove', e => {
   }
   S.needSort = true; S.dirty = true;
 });
-canvas.addEventListener('pointerup', () => { drag = null; });
+canvas.addEventListener('pointerup', () => { if (drag?.light) lightURL(); drag = null; });
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
@@ -395,8 +425,149 @@ function renderOpts() {
     creaseFade: +$('creaseW').value || 0,
     degree: +$('degree').value,
     bg: [1, 3, 5].map(i => parseInt(bg.slice(i, i + 2), 16) / 255),
+    light: lightOpts(),
   };
 }
+
+// ---------- relighting (light.js) ----------
+
+const LIGHT_IDS = ['lightView', 'normalMix', 'ambient', 'sky', 'ground', 'wrap', 'exposure', 'spec', 'shininess', 'linear', 'shoulder', 'dcOnly',
+  'lightType', 'lightTint', 'lightPower', 'lightK', 'lightAz', 'lightEl', 'lightDist', 'lightRange', 'lightCone', 'lightSoft', 'lightFollow', 'lightWithCam', 'shadows', 'shadowStrength', 'shadowSoft', 'shadowBias'];
+const LIGHT_OUT = { exposure: x => `×${(+x).toFixed(2)}`, lightPower: x => (+x).toFixed(1), lightK: x => `${x} K`, lightAz: x => `${x}°`,
+  lightEl: x => `${x}°`, lightDist: x => `${(+x).toFixed(2)} m`, lightRange: x => +x ? `${(+x).toFixed(1)} m` : 'none' };
+function lightOutputs() {
+  for (const [id, f] of Object.entries(LIGHT_OUT)) $(`${id}Out`).textContent = f($(id).value);
+  document.body.classList.toggle('lit', +$('lightView').value > 0);
+}
+for (const id of LIGHT_IDS) {
+  $(id).addEventListener('input', () => { lightOutputs(); S.dirty = true; });
+  $(id).addEventListener('change', lightURL);
+}
+
+// The panel's lighting values that differ from the defaults ({} = as captured); kept in the URL (?light=JSON) and the PNG
+function lightPanel() {
+  const o = {};
+  for (const id of LIGHT_IDS) {
+    const e = $(id), v = e.type === 'checkbox' ? e.checked : e.value;
+    if (v !== (e.type === 'checkbox' ? e.defaultChecked : e.tagName === 'SELECT' ? [...e.options].find(x => x.defaultSelected)?.value ?? e.options[0].value : e.defaultValue)) o[id] = v;
+  }
+  return o;
+}
+function setLightPanel(o) {
+  for (const [id, v] of Object.entries(o)) {
+    if (!LIGHT_IDS.includes(id)) continue;
+    if ($(id).type === 'checkbox') $(id).checked = !!v; else $(id).value = v;
+  }
+  lightOutputs(); S.dirty = true;
+}
+function lightURL() {
+  const q = new URLSearchParams(location.search), o = lightPanel();
+  if (Object.keys(o).length) q.set('light', JSON.stringify(o)); else q.delete('light');
+  history.replaceState(null, '', `?${q}`);
+}
+$('lightFollow').addEventListener('change', () => { S.lightTarget = $('lightFollow').checked ? null : lightTarget(Math.max(S.shown, 0)); });
+lightOutputs();
+
+const lightParams = () => ({ az: +$('lightAz').value, el: +$('lightEl').value, dist: +$('lightDist').value, withCamera: $('lightWithCam').checked });
+const lightTarget = fr => S.lightTarget || bodyTarget(fr);
+const rotInv = v => apply({ R: S.Winv.R, t: [0, 0, 0] }, v);
+
+// The light in the b2crunner frame: { pos, dir, target }
+function lightPlaced(fr) {
+  const tgt = lightTarget(fr), L = placeLight(lightParams(), tgt, S.orbit);
+  return { pos: apply(S.Winv, L.pos), dir: rotInv(L.dir), target: apply(S.Winv, tgt) };
+}
+
+function lightOpts() {
+  const view = +$('lightView').value;
+  if (!view || !S.W) return { view: 0 };
+  const fr = Math.max(S.shown, 0), R = S.W.R, linear = $('linear').checked, amb = +$('ambient').value;
+  const type = +$('lightType').value, lights = [];
+  let shadow = null;
+  if (type) {
+    const L = lightPlaced(fr), tint = hexRGB($('lightTint').value, linear), K = kelvinRGB(+$('lightK').value), pw = +$('lightPower').value;
+    const col = [...K.map((k, j) => k * tint[j] * (type === 3 ? pw / 4 : pw)), type === 3 ? 0 : +$('lightRange').value];   // a sun's power at 1/4
+    const outer = +$('lightCone').value * Math.PI / 180, inner = outer * (1 - +$('lightSoft').value);
+    lights.push({
+      pos: type === 3 ? [...L.dir, 0] : [...L.pos, 1], col,
+      spot: type === 2 ? [...L.dir, Math.cos(outer)] : [0, 0, 0, -2], soft: [Math.max(Math.cos(inner), Math.cos(outer) + 1e-4)],
+    });
+    if ($('shadows').checked && S.info.rigged) {
+      // the sphere around the posed body (its layer's centroid and box) and a margin for the other layers
+      const b = S.info.bodies, o = Math.min(fr, S.nframes - 1) * 6;
+      const centre = [b[o], b[o + 1], b[o + 2]], radius = 0.5 * Math.hypot(b[o + 3], b[o + 4], b[o + 5]) * 1.15 + 0.1;
+      shadow = { ...shadowFrustum(type === 3 ? { dir: L.dir } : { pos: L.pos }, centre, radius, rotInv([0, 1, 0])),
+        bias: +$('shadowBias').value / 100, soft: +$('shadowSoft').value, strength: +$('shadowStrength').value };
+    }
+  }
+  return {
+    view, normalMix: +$('normalMix').value,
+    WR: [R[0][0], R[1][0], R[2][0], R[0][1], R[1][1], R[2][1], R[0][2], R[1][2], R[2][2]],
+    sky: hexRGB($('sky').value, linear).map(x => x * amb), ground: hexRGB($('ground').value, linear).map(x => x * amb), up: rotInv([0, 1, 0]),
+    wrap: +$('wrap').value, exposure: +$('exposure').value, spec: +$('spec').value, shininess: +$('shininess').value || 1,
+    linear, shoulder: $('shoulder').checked, dcOnly: $('dcOnly').checked, lights, shadow,
+  };
+}
+
+// the light's dot over the canvas
+function updateLightDot(cam) {
+  const dot = $('lightDot'), on = +$('lightView').value > 0 && +$('lightType').value > 0 && !!S.W;
+  dot.classList.toggle('on', on);
+  if (!on) return;
+  const L = lightPlaced(Math.max(S.shown, 0)), p = L.pos, R = cam.R;
+  const c = [0, 1, 2].map(r => R[r * 3] * p[0] + R[r * 3 + 1] * p[1] + R[r * 3 + 2] * p[2] + cam.t[r]);
+  // off screen or behind the camera: pinned to the nearest edge (hollow), in the direction of the light
+  let x, y, off = c[2] < 0.01;
+  if (!off) { x = cam.fx * c[0] / c[2] + cam.cx; y = cam.fy * c[1] / c[2] + cam.cy; }
+  else { const l = Math.hypot(c[0], c[1]) || 1; x = cam.cx + c[0] / l * 1e6; y = cam.cy + c[1] / l * 1e6; }
+  // clamp (along the line from the view's centre) into the view, clear of the panel
+  const k = canvas.clientWidth / canvas.width, cr = canvas.getBoundingClientRect(), pr = $('panel').getBoundingClientRect();
+  const x0 = Math.max(12, pr.right - cr.left + 12), x1 = cr.width - 12, y0 = 12, y1 = cr.height - 12;
+  const ox = (x0 + x1) / 2, oy = (y0 + y1) / 2, dx = x * k - ox, dy = y * k - oy;
+  const s = Math.min(1, (x1 - ox) / Math.max(Math.abs(dx), 1e-9), (y1 - oy) / Math.max(Math.abs(dy), 1e-9));
+  if (s < 1) off = true;
+  dot.style.left = `${ox + dx * s}px`; dot.style.top = `${oy + dy * s}px`;
+  const tc = L.target, tz = R[6] * tc[0] + R[7] * tc[1] + R[8] * tc[2] + cam.t[2];
+  dot.classList.toggle('behind', !off && c[2] > tz);   // behind the body's centre
+  dot.classList.toggle('off', off);
+}
+
+// Moving the light: the dot follows the cursor over the sphere of the light's distance around its target (on the
+// near or the far half, whichever the light was on when the drag began).
+function lightDragStart(e) {
+  const cam = camera(Math.max(S.shown, 0), canvas.width, canvas.height), L = lightPlaced(Math.max(S.shown, 0));
+  const fwd = [cam.R[6], cam.R[7], cam.R[8]];
+  return { light: true, far: fwd.reduce((s, f, j) => s + f * (L.pos[j] - L.target[j]), 0) > 0 };
+}
+function lightDragTo(e, far) {
+  const r = canvas.getBoundingClientRect(), k = canvas.width / canvas.clientWidth;
+  const fr = Math.max(S.shown, 0), cam = camera(fr, canvas.width, canvas.height), R = cam.R;
+  const x = ((e.clientX - r.left) * k - cam.cx) / cam.fx, y = ((e.clientY - r.top) * k - cam.cy) / cam.fy;
+  const d = norm([0, 1, 2].map(j => R[j] * x + R[3 + j] * y + R[6 + j]));   // the ray, b2crunner frame
+  const c = apply(S.Winv, lightTarget(fr)), oc = cam.pos.map((p, j) => p - c[j]), rad = +$('lightDist').value;
+  const bq = oc.reduce((s, v, j) => s + v * d[j], 0), disc = bq * bq - (oc.reduce((s, v) => s + v * v, 0) - rad * rad);
+  const t = disc >= 0 ? -bq + (far ? 1 : -1) * Math.sqrt(disc) : -bq;   // a miss: the ray's closest point, onto the sphere
+  const off = norm(cam.pos.map((p, j) => p + t * d[j] - c[j]));
+  const g = apply({ R: S.W.R, t: [0, 0, 0] }, off);   // glTF world
+  let az = Math.atan2(g[0], g[2]) * 180 / Math.PI, el = Math.asin(Math.max(-1, Math.min(1, g[1]))) * 180 / Math.PI;
+  if ($('lightWithCam').checked && S.orbit) { az -= S.orbit.az; el -= S.orbit.el; }
+  $('lightAz').value = Math.round(((az % 360) + 540) % 360 - 180);
+  $('lightEl').value = Math.round(Math.max(-89, Math.min(89, el)));
+  lightOutputs(); S.dirty = true;
+}
+$('lightDot').addEventListener('pointerdown', e => {
+  e.stopPropagation();
+  $('lightDot').setPointerCapture(e.pointerId);
+  drag = lightDragStart(e);
+});
+$('lightDot').addEventListener('pointermove', e => { if (drag?.light) lightDragTo(e, drag.far); });
+$('lightDot').addEventListener('pointerup', () => { drag = null; lightURL(); });
+$('lightDot').addEventListener('wheel', e => {
+  e.preventDefault();
+  const el = $('lightDist');
+  el.value = Math.max(+el.min, Math.min(+el.max, +el.value * Math.exp(e.deltaY * 0.001)));
+  lightOutputs(); S.dirty = true; lightURL();
+}, { passive: false });
 
 // ---------- save the view ----------
 
@@ -440,7 +611,8 @@ async function saveShot() {
     frame: fr, width: W, height: H,
     camera: { name: String(fr), fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy, rotation, position: cam.pos },
     orbit: S.orbit, follow: $('follow').checked, fov_deg: +$('fov').value,
-    options: { ...renderOpts(), ...frameOpts() },
+    options: { ...renderOpts(), light: undefined, ...frameOpts() },
+    lighting: +$('lightView').value ? { ...lightPanel(), note: 'viewer-only relighting (web/light.js); viewer_shot.py does not render it' } : null,
     url: location.href, saved: new Date().toISOString(),
   };
   const png = pngWithText(new Uint8Array(await blob.arrayBuffer()), 'b2cviewer', JSON.stringify(meta));
@@ -458,7 +630,7 @@ $('shot').onclick = saveShot;
 
 window.addEventListener('keydown', e => {
   if (e.key === 'o' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $('openFile').click(); return; }
-  if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'range' || e.target.tagName === 'SELECT') return;
+  if (e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && e.target.type !== 'range' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;
   const toggle = id => { const el = $(id); if (el.disabled) return; el.checked = !el.checked; el.dispatchEvent(new Event('change')); el.dispatchEvent(new Event('input')); };
   if (e.key === ' ') { e.preventDefault(); setPlaying(!S.playing); }
   else if (e.key === 'ArrowRight') { setPlaying(false); setFrame(S.frame + 1); }
@@ -467,7 +639,10 @@ window.addEventListener('keydown', e => {
   else if (e.key === 'f') toggle('follow');
   else if (e.key === 's') saveShot();
   else if (e.key === 'b') swapAB();
+  else if (e.key === 'l') S.keyL = true;
 });
+window.addEventListener('keyup', e => { if (e.key === 'l') S.keyL = false; });
+window.addEventListener('blur', () => { S.keyL = false; });
 
 // ---------- loop ----------
 
@@ -497,7 +672,9 @@ function tick(t) {
   pump();
   if (S.dirty && S.shown >= 0) {
     S.dirty = false;
-    renderer.render(camera(S.shown, canvas.width, canvas.height), renderOpts());
+    const cam = camera(S.shown, canvas.width, canvas.height);
+    renderer.render(cam, renderOpts());
+    updateLightDot(cam);
   }
   requestAnimationFrame(tick);
 }
@@ -505,5 +682,5 @@ requestAnimationFrame(tick);
 init();
 
 // for scripted checks: the state and a way to wait for a settled frame
-window.b2cviewer = { S, setFrame, setPlaying, renderer,
+window.b2cviewer = { S, setFrame, setPlaying, renderer, camera, renderOpts,
   settled: () => S.ready && !S.loading && !S.busy && !S.needFrame && !S.needSort && S.shown === S.frame && !S.dirty };

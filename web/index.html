@@ -62,12 +62,21 @@
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
   body.unrigged .rig { display: none !important; }   /* an unrigged subject: no clips, no posing, no timeline */
   #help { color: var(--dim); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
+  #lightPanel input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #lightPanel input[type=color] { width: 26px; height: 20px; padding: 0; border: 1px solid var(--line); background: none; flex: none; }
+  #lightPanel output, #lightPanel small { color: var(--dim); min-width: 44px; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  body:not(.lit) #lightPanel { display: none; }
+  #lightDot { background: #ffe9a8; position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%; border: 2px solid #fff;
+              box-shadow: 0 0 0 1px #000, 0 0 10px 2px rgba(255, 230, 150, 0.8); cursor: move; display: none; touch-action: none; }
+  #lightDot.on { display: block; }
+  #lightDot.behind { opacity: 0.35; }
+  #lightDot.off { background: none; box-shadow: 0 0 0 1px #000; border-style: dashed; }
   kbd { background: #0f1114; border: 1px solid var(--line); border-radius: 3px; padding: 0 4px; font-size: 11px; }
 </style>
 </head>
 <body>
 <div id="stage">
-  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="drop">Drop a subject (.glb or .sog) and its clip files (.clip.glb or .clip.zip)</div></div>
+  <div id="view"><canvas id="canvas"></canvas><div id="abBadge"></div><div id="lightDot" title="The light: drag to move it, scroll for its distance"></div><div id="drop">Drop a subject (.glb or .sog) and its clip files (.clip.glb or .clip.zip)</div></div>
 </div>
 
 <div id="panel">
@@ -94,9 +103,34 @@
   <label class="check"><input type="checkbox" id="follow" checked> Follow the body <small>(F)</small></label>
   <label class="row"><span>FOV</span><input type="number" id="fov" value="45" step="5" min="10" max="120"> <span style="color:var(--dim)">background</span> <input type="color" id="bg" value="#808080"></label>
 
+  <h3>Lighting <small style="text-transform:none;letter-spacing:0">(experimental)</small></h3>
+  <label class="row"><span>Show</span><select id="lightView"><option value="0">off (as captured)</option><option value="1">relit</option><option value="2">normals</option><option value="3">lighting only</option></select></label>
+  <div id="lightPanel">
+  <label class="row"><span>Normals</span><input type="range" id="normalMix" min="0" max="1" step="0.05" value="0.5"><small>cage ↔ splat</small></label>
+  <label class="row"><span>Ambient</span><input type="range" id="ambient" min="0" max="2" step="0.05" value="0.35"><input type="color" id="sky" value="#ffffff" title="sky (from above)"><input type="color" id="ground" value="#ffffff" title="ground (from below)"></label>
+  <label class="row"><span>Wrap</span><input type="range" id="wrap" min="0" max="1" step="0.05" value="0.3"><small>soft terminator</small></label>
+  <label class="row"><span>Exposure</span><input type="range" id="exposure" min="0" max="3" step="0.05" value="1"><output id="exposureOut"></output></label>
+  <label class="row"><span>Specular</span><input type="range" id="spec" min="0" max="1" step="0.02" value="0"><input type="number" id="shininess" value="32" min="1" max="512" step="1" title="shininess"></label>
+  <div class="inline" style="margin-left:0"><label class="check"><input type="checkbox" id="linear" checked> linear (γ 2.2)</label><label class="check"><input type="checkbox" id="shoulder" checked> soft highlights</label></div>
+  <label class="check"><input type="checkbox" id="dcOnly"> Keep captured highlights <small>(relight the SH DC only)</small></label>
+  <div class="row"><span>Light</span><select id="lightType"><option value="0">off</option><option value="1" selected>point</option><option value="2">spot</option><option value="3">sun</option></select><input type="color" id="lightTint" value="#ffffff" title="tint"></div>
+  <label class="row"><span>Power</span><input type="range" id="lightPower" min="0" max="20" step="0.1" value="3"><output id="lightPowerOut"></output></label>
+  <label class="row"><span>Kelvin</span><input type="range" id="lightK" min="1500" max="12000" step="100" value="5500"><output id="lightKOut"></output></label>
+  <label class="row"><span>Azimuth</span><input type="range" id="lightAz" min="-180" max="180" step="1" value="45"><output id="lightAzOut"></output></label>
+  <label class="row"><span>Elevation</span><input type="range" id="lightEl" min="-89" max="89" step="1" value="30"><output id="lightElOut"></output></label>
+  <label class="row"><span>Distance</span><input type="range" id="lightDist" min="0.2" max="8" step="0.05" value="1.5"><output id="lightDistOut"></output></label>
+  <label class="row"><span>Range</span><input type="range" id="lightRange" min="0" max="10" step="0.1" value="0"><output id="lightRangeOut"></output></label>
+  <label class="row"><span>Cone</span><input type="range" id="lightCone" min="2" max="90" step="1" value="25"><input type="range" id="lightSoft" min="0" max="1" step="0.05" value="0.3" title="cone softness"></label>
+  <div class="row"><label class="check" style="width:58px;margin:0"><input type="checkbox" id="shadows" checked> <span>Shadows</span></label><input type="range" id="shadowStrength" min="0" max="1" step="0.05" value="1" title="shadow strength"><input type="range" id="shadowSoft" min="0" max="24" step="1" value="6" title="softness (shadow map texels)"></div>
+  <label class="row"><span>Bias</span><input type="number" id="shadowBias" value="2" step="0.5" min="0" max="20"><small>cm (less: contact shadows, more: no self-shadow acne)</small></label>
+  <label class="check"><input type="checkbox" id="lightFollow" checked> Light follows the body</label>
+  <label class="check"><input type="checkbox" id="lightWithCam"> Light moves with the camera</label>
+  <div style="color:var(--dim);font-size:11.5px">Drag the light's dot (or hold <kbd>L</kbd> and drag) to move it; scroll over the dot for its distance.</div>
+  </div>
+
   <div id="info"></div>
   <div id="help">Drag to orbit, right-drag or shift-drag to pan, scroll to zoom, double-click to reset.
-<kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
+<kbd>L</kbd>-drag moves the light. <kbd>Space</kbd> play, <kbd>←</kbd><kbd>→</kbd> step, <kbd>B</kbd> swap a clip with its <code>_fix</code> partner (same frame and view), <kbd>S</kbd> save the view as a PNG (camera, frame and options embedded:
 b2crig <code>tools/viewer_shot.py</code> re-renders it). Open or drop local files (a subject .glb or .sog and its .clip.glb or .clip.zip clips, together or clips later) to view them; they are read in the browser, not uploaded.</div>
 </div>
 
