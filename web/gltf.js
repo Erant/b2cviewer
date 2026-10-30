@@ -1,7 +1,8 @@
 // Reader for the b2c glTF files (~/Projects/b2cgltf/SPEC.md): a b2crig-rigged subject file and its clip files, and
 // their web forms (sog.js): a subject .sog (SOG splat + binding textures + rig.glb) and .clip.zip files.
-//   parseSubject  the current splat (7.1) with b2ctrain's binding (5.3), the cage (5.2) and the skeleton (4.3); a
-//                 file b2crig has not rigged yet, or a plain .sog, gives the splat alone (shown unposed)
+//   parseSubject  the current splat (7.1), or one of its LOD levels (4.7, 7.1a), with b2ctrain's binding (5.3), the
+//                 cage (5.2) and the skeleton (4.3); a file b2crig has not rigged yet, or a plain .sog, gives the
+//                 splat alone (shown unposed)
 //   parseClip     one clip file (6), checked against its subject: same b2c_id, same rig hash, same skeleton
 //   poseCage      a clip frame's posed cage (7.2 steps 1-2): the cage skinned by the joints relative to the skeleton
 //                 root, plus the clip's residual
@@ -9,7 +10,7 @@
 import { isZip, readZip, parseSog } from './sog.js';
 
 const KHR = 'KHR_gaussian_splatting', RIG = 'B2CRIG_rig', BIND = 'B2CRIG_splat_cage', CLIP = 'B2CRIG_clip',
-  RES = 'B2CRIG_cage_residual';
+  RES = 'B2CRIG_cage_residual', LOD = 'MSFT_lod';
 const NCOMP = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT3: 9, MAT4: 16 };
 const TYPED = { 5120: Int8Array, 5121: Uint8Array, 5122: Int16Array, 5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array };
 
@@ -111,9 +112,11 @@ function nodeMatrix(nd) {   // column-major 4x4
 
 // The splat (display form converted to the renderer's: logit opacity, log scales, w x y z rotation, SH
 // coefficient-major per splat), b2ctrain's binding, the cage, the skeleton and b2ctrain's render settings.
-// decode: WebP decoder for a .sog (sog.js's WebGL2 readback by default).
-export async function parseSubject(buf, decode) {
-  if (isZip(buf)) return parseWebSubject(await readZip(buf), decode);
+// level: the member of the current splat's LOD chain to show (0 = the current splat itself); the result's `lods` is
+// the chain (lodChain), `lodProblem` why a chain the file has is not used.
+// decode: WebP decoder for a .sog (sog.js's WebGL2 readback by default; a web subject has no LOD levels).
+export async function parseSubject(buf, decode, level = 0) {
+  if (isZip(buf)) return { ...await parseWebSubject(await readZip(buf), decode), lods: null, lodProblem: null };
   const { json, acc } = readGlb(buf);
   const id = json.asset?.extras?.b2c_id;
   if (!id) throw new Error('not a b2c subject file (no asset.extras.b2c_id)');
@@ -121,12 +124,14 @@ export async function parseSubject(buf, decode) {
   const rig = json.extensions?.[RIG];
   if (rig) version(rig, RIG);
 
-  // the splat
-  const si = currentSplat(json);
-  if (rig && si !== rig.splatNode) throw new Error(`the current splat (node ${si}) is not b2crig's rigged splat (node ${rig.splatNode})`);
-  const prim = json.meshes[json.nodes[si].mesh].primitives.find(p => p.extensions?.[KHR]), at = prim.attributes;
+  // the splat: the current one or a level of its chain (in no scene; posed and placed as the current splat is, 7.1a)
+  const base = currentSplat(json);
+  if (rig && base !== rig.splatNode) throw new Error(`the current splat (node ${base}) is not b2crig's rigged splat (node ${rig.splatNode})`);
+  const { lods, problem: lodProblem } = await lodChain(json, acc, base);
+  if (!lods[level]) level = 0;   // e.g. ?lod= from another subject
+  const si = lods[level].node, prim = splatPrim(json, si), at = prim.attributes;
   const be = prim.extensions?.[BIND];
-  if (rig && !be) throw new Error('the rigged splat has no B2CRIG_splat_cage binding');
+  if (rig && !be) throw new Error(`the rigged splat${level ? `'s LOD level ${level}` : ''} has no B2CRIG_splat_cage binding`);
   if (be) version(be, BIND);
   const A = s => at[`${KHR}:${s}`] !== undefined ? acc(at[`${KHR}:${s}`]) : null;
   const pos = Float32Array.from(acc(at.POSITION)), n = pos.length / 3;
@@ -146,10 +151,68 @@ export async function parseSubject(buf, decode) {
     for (let k = 0; k < K; k++) for (let c = 0; c < 3; c++) sh[(i * K + k) * 3 + c] = coefs[k][i * 3 + c];
   }
   const splat = { n, degree, K, pos, op, quat, ls, sh };
-  if (!rig) return { id, splat, binding: null, cage: null, skeleton: null, rigHash: null, render: {}, W: worldMatrix(json, si) };
+  const lod = { lods, lodProblem, level };
+  if (!rig) return { id, splat, binding: null, cage: null, skeleton: null, rigHash: null, render: {}, W: worldMatrix(json, base), ...lod };
   const binding = { face: Int32Array.from(acc(be.face)),   // 0xFFFFFFFF (unbound) wraps to -1
                     bary: Float32Array.from(acc(be.barycentric)), offset: Float32Array.from(acc(be.offset)), posing: be.posing };
-  return { id, splat, binding, ...await rigOf(json, acc, rig) };
+  return { id, splat, binding, ...await rigOf(json, acc, rig), ...lod };
+}
+
+const splatPrim = (json, i) => json.nodes[i].mesh === undefined ? undefined
+  : json.meshes[json.nodes[i].mesh].primitives.find(p => p.extensions?.[KHR]);
+
+// SPEC 4.7 / 7.1a: the chain behind the splat node `base`, [{ node, name, count, maxScreenHeightPx }], most detailed
+// first (the base's height null). The base alone when it has no chain, or when the chain is stale or broken (a
+// subset of SPEC 8's checks: what this viewer relies on); `problem` then says why.
+async function lodChain(json, acc, base) {
+  const count = i => json.accessors[splatPrim(json, i).attributes.POSITION].count;
+  const lods = [{ node: base, name: json.nodes[base].name || `node ${base}`, count: count(base), maxScreenHeightPx: null }];
+  const ext = json.nodes[base].extensions || {};
+  if (!ext[LOD]) return { lods, problem: null };
+  const ids = ext[LOD].ids || [], rec = ext.B2CRIG_lod ?? ext.B2C_lod, problems = [];
+  if (!rec) problems.push('MSFT_lod but no B2C_lod / B2CRIG_lod record');
+  else if (rec.version !== 1) problems.push(`level record version ${rec.version} (this viewer reads 1)`);
+  else {
+    const lv = rec.levels || [];
+    if (lv.length !== ids.length || lv.some((r, k) => r.node !== ids[k])) problems.push("the level record's nodes do not match MSFT_lod.ids");
+    let prev = lods[0].count, hPrev = Infinity;
+    for (const r of lv) {
+      if (!json.nodes[r.node] || !splatPrim(json, r.node)) { problems.push(`level node ${r.node} is not a splat`); continue; }
+      const c = count(r.node);
+      if (c !== r.count) problems.push(`level node ${r.node}: record count ${r.count}, splat ${c}`);
+      if (c >= prev) problems.push(`level node ${r.node}: ${c} splats, not fewer than the ${prev} before it`);
+      if (!(r.maxScreenHeightPx > 0 && r.maxScreenHeightPx < hPrev)) problems.push('maxScreenHeightPx does not strictly decrease');
+      prev = c; hPrev = r.maxScreenHeightPx;
+    }
+    if (!problems.length) {
+      const src = await sourceHash(json, acc, base);
+      if (lv.some(r => r.source !== src)) problems.push(`stale: a level's source is not the base's (${src.slice(0, 19)}…)`);
+    }
+    if (!problems.length) for (const r of lv)
+      lods.push({ node: r.node, name: json.nodes[r.node].name || `node ${r.node}`, count: r.count, maxScreenHeightPx: r.maxScreenHeightPx });
+  }
+  return { lods, problem: problems.length ? problems.join('; ') : null };
+}
+
+// SPEC 4.7 `source`: SHA-256 over the splat's POSITION, ROTATION, SCALE, OPACITY, then SH_DEGREE_d_COEF_n, as stored
+// (little-endian float32, no stride padding). "sha256:" + lowercase hex.
+async function sourceHash(json, acc, node) {
+  const at = splatPrim(json, node).attributes, keys = ['POSITION', `${KHR}:ROTATION`, `${KHR}:SCALE`, `${KHR}:OPACITY`];
+  for (let d = 0; at[`${KHR}:SH_DEGREE_${d}_COEF_0`] !== undefined; d++)
+    for (let c = 0; c <= 2 * d; c++) keys.push(`${KHR}:SH_DEGREE_${d}_COEF_${c}`);
+  return 'sha256:' + await digest(keys.map(k => {
+    const a = acc(at[k]);
+    if (!(a instanceof Float32Array)) throw new Error(`LOD source hash: ${k} is not float32`);
+    return a;
+  }));
+}
+
+// SHA-256 of the concatenated bytes of typed arrays, lowercase hex
+async function digest(arrays) {
+  const all = new Uint8Array(arrays.reduce((s, a) => s + a.byteLength, 0));
+  let o = 0; for (const a of arrays) { all.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), o); o += a.byteLength; }
+  const h = globalThis.crypto?.subtle ? new Uint8Array(await crypto.subtle.digest('SHA-256', all)) : sha256(all);
+  return Array.from(h, b => b.toString(16).padStart(2, '0')).join('');
 }
 
 // A web subject: a plain SOG is a splat alone (no b2c_id, no rig). PlayCanvas shows a SOG turned 180 degrees about
@@ -200,20 +263,17 @@ async function rigOf(json, acc, rig) {
 // JOINTS_n / WEIGHTS_n (n ascending, JOINTS first); then the inverse bind matrices (row-major, as numpy holds them),
 // rest rotations and rest translations, all float32 little-endian.
 async function hashRig(acc, prims, sk) {
-  const bytes = a => new Uint8Array(a.buffer, a.byteOffset, a.byteLength), parts = [];
+  const parts = [];
   for (const p of prims) {
     const at = p.attributes;
     const skin = Object.keys(at).filter(k => /^(JOINTS|WEIGHTS)_\d+$/.test(k))
       .sort((a, b) => (+a.split('_')[1] - +b.split('_')[1]) || (a < b ? -1 : 1));
-    parts.push(bytes(acc(at.POSITION)), bytes(acc(p.indices)), ...skin.map(k => bytes(acc(at[k]))));
+    parts.push(acc(at.POSITION), acc(p.indices), ...skin.map(k => acc(at[k])));
   }
   const J = sk.joints.length, ibmRows = new Float32Array(J * 16);
   for (let j = 0; j < J; j++) for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) ibmRows[j * 16 + r * 4 + c] = sk.ibm[j * 16 + c * 4 + r];
-  parts.push(bytes(ibmRows), bytes(sk.restQ), bytes(sk.restT));
-  const all = new Uint8Array(parts.reduce((s, x) => s + x.length, 0));
-  let o = 0; for (const x of parts) { all.set(x, o); o += x.length; }
-  const h = globalThis.crypto?.subtle ? new Uint8Array(await crypto.subtle.digest('SHA-256', all)) : sha256(all);
-  return Array.from(h, b => b.toString(16).padStart(2, '0')).join('');
+  parts.push(ibmRows, sk.restQ, sk.restT);
+  return digest(parts);
 }
 
 // SHA-256 (FIPS 180-4) for pages served over plain HTTP from a non-localhost address: browsers only expose

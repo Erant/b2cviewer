@@ -61,6 +61,7 @@
   .progress.on { display: block; }
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width 0.1s; }
   body.unrigged .rig { display: none !important; }   /* an unrigged subject: no clips, no posing, no timeline */
+  body:not(.lod) #lodRow { display: none; }            /* a splat without LOD levels (SPEC 4.7) */
   #help { color: var(--dim); font-size: 11.5px; margin-top: 10px; line-height: 1.5; }
   #lightPanel input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); }
   #lightPanel input[type=color] { width: 26px; height: 20px; padding: 0; border: 1px solid var(--line); background: none; flex: none; }
@@ -85,6 +86,7 @@
   <input type="file" id="openFile" accept=".glb,.sog,.zip" multiple hidden>
   <label class="row"><span>Subject</span><select id="subject"></select></label>
   <div class="row rig"><span>Clip</span><select id="clip"></select><button id="abSwap" disabled title="Swap with its A/B partner: CLIP and CLIP_fix, at the same frame and view (B)">⇄</button></div>
+  <label class="row" id="lodRow" title="The splat's LOD levels (b2cgltf SPEC 4.7): each is meant for the subject shown at most that many pixels tall"><span>Detail</span><select id="lod"></select></label>
   <div class="progress" id="progress"><div></div></div>
   <div id="status">Connecting…</div>
 

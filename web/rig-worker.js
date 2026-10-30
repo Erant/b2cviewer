@@ -1,10 +1,10 @@
 // Worker: parses the subject and clip files (gltf.js), and per request poses a clip frame's cage, builds the face
 // texture and a back-to-front splat order for the current camera. Without a clip it shows the rest pose; an unrigged
-// subject is shown as delivered.
+// subject is shown as delivered. Another LOD level of the same subject re-parses the kept subject file and keeps the clip.
 import { parseSubject, parseClip, poseCage } from './gltf.js';
 import { Rig } from './rig.js';
 
-let subject = null, clip = null, rig = null;
+let subject = null, subjectBuf = null, clip = null, rig = null;
 let last = null;   // { fr, centres }: the centres of the frame last computed
 
 const post = (msg, transfer = []) => self.postMessage(msg, transfer);
@@ -38,9 +38,11 @@ self.onmessage = async ({ data: m }) => {
   try {
     if (m.type === 'load') {
       const t0 = performance.now(), msg = { type: 'loaded' }, transfer = [];
-      if (m.subject) {
-        progress('parsing the subject file', 0);
-        subject = await parseSubject(m.subject); clip = null;
+      if (m.subject || (subject && (m.level ?? 0) !== subject.level)) {
+        progress(m.subject ? 'parsing the subject file' : `parsing LOD level ${m.level}`, 0);
+        const parsed = await parseSubject(m.subject ?? subjectBuf, undefined, m.level ?? 0);
+        if (m.subject) { subjectBuf = m.subject; clip = null; }
+        subject = parsed;
         rig = new Rig(subject.splat, subject.binding, subject.cage, subject.skeleton);
         const tex = rig.splatTexels(), sh = rig.shTexels();
         msg.splatTex = tex; msg.sh = sh; transfer.push(tex.buffer, sh.data.buffer);
@@ -58,7 +60,7 @@ self.onmessage = async ({ data: m }) => {
       Object.assign(msg, {
         bodies, n: splat.n, degree: splat.degree, rigged: !!cage, nv: cage?.nv ?? 0, nf: cage?.nf ?? 1, nframes: T,
         nUnbound: rig.nUnbound, layers: cage ? cage.layers.map(L => L.name) : [], W: Array.from(subject.W),
-        render: subject.render, id: subject.id,
+        render: subject.render, id: subject.id, lods: subject.lods, lodProblem: subject.lodProblem, level: subject.level,
         clip: clip ? { name: clip.name, fps: clip.fps, residual: !!clip.residual } : null, ms: performance.now() - t0,
       });
       post(msg, transfer);

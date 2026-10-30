@@ -12,7 +12,7 @@ const worker = new Worker('rig-worker.js', { type: 'module' });
 const S = {
   index: null,
   dropped: null,         // { subject: {key, get}, clips: [{name, key, get}] } from opened / dropped local files
-  loaded: { subject: null, clip: null },   // source keys currently in the worker
+  loaded: { subject: null, clip: null, level: 0 },   // source keys and the LOD level currently in the worker
   info: null,            // the worker's 'loaded' message
   nframes: 0, bodies: null, W: null, Winv: null,
   frame: 0, shown: -1, playing: false, playT0: 0,
@@ -38,6 +38,8 @@ function updateInfo() {
   if (!I) { $('info').textContent = ''; return; }
   const lines = [
     `${fmt(I.n)} splats · SH ${I.degree}` + (I.nUnbound ? ` · ${fmt(I.nUnbound)} unbound` : ''),
+    I.lodProblem ? `LOD chain not used: ${I.lodProblem}`
+      : I.lods?.length > 1 ? `LOD ${I.level} of ${I.lods.length - 1} · ${I.lods[I.level].name}` : null,
     I.rigged ? `cage ${fmt(I.nv)} verts · ${fmt(I.nf)} tris · ${I.layers.join(', ')}`
              : I.id ? 'not rigged: the splat as b2crunner delivered it (b2crig: tools/export_gltf.py rig)' : 'a plain splat: no rig',
     !I.rigged ? null : I.clip ? `clip ${I.clip.name} · ${I.nframes} frames at ${I.clip.fps} fps` + (I.clip.residual ? '' : ' · no residual (plain skinning)')
@@ -90,13 +92,14 @@ async function fetchBuf(url, label) {
   return out.buffer;
 }
 
-// subject, clip: { key, get: label => Promise<ArrayBuffer> }; clip null = the rest pose. Only changed files are sent.
-async function load(subject, clip) {
+// subject, clip: { key, get: label => Promise<ArrayBuffer> }; clip null = the rest pose; level: the LOD level (0 = the
+// full splat; a level the subject lacks falls back to 0). Only changed files are sent.
+async function load(subject, clip, level = 0) {
   if (S.loading) return;
   S.loading = true;
   setInputs(false);
   try {
-    const msg = { type: 'load' }, transfer = [];
+    const msg = { type: 'load', level }, transfer = [];
     const newSubject = subject.key !== S.loaded.subject;
     if (newSubject) { msg.subject = await subject.get('subject'); transfer.push(msg.subject); }
     if (newSubject || (clip?.key ?? null) !== S.loaded.clip) {
@@ -105,7 +108,7 @@ async function load(subject, clip) {
     }
     progress(0);
     const info = await workerLoad(msg, transfer);
-    S.loaded = { subject: subject.key, clip: clip?.key ?? null };
+    S.loaded = { subject: subject.key, clip: clip?.key ?? null, level: info.level };
     if (info.splatTex) renderer.setSplats(info.splatTex, info.n);
     if (info.sh) renderer.setSH(info.sh, info.n, info.degree);
     if (newSubject) {
@@ -117,6 +120,7 @@ async function load(subject, clip) {
       S.orbit = null;
     }
     S.info = info;
+    fillLod(info);
     document.body.classList.toggle('unrigged', !info.rigged);   // hide what only a rig drives (index.html .rig)
     S.nframes = info.nframes;
     S.bodies = smoothBodies(info.bodies, info.nframes);
@@ -139,7 +143,15 @@ async function load(subject, clip) {
   }
 }
 
-function setInputs(on) { for (const id of ['subject', 'clip']) $(id).disabled = !on; }
+function setInputs(on) { for (const id of ['subject', 'clip', 'lod']) $(id).disabled = !on; }
+
+// The current splat's LOD chain (SPEC 4.7, gltf.js lodChain): the row shows only when there are levels to pick.
+function fillLod(info) {
+  const L = info.lods || [];
+  document.body.classList.toggle('lod', L.length > 1);
+  fillSelect($('lod'), L.map((l, k) => ({ value: String(k), title: `node ${l.node}: ${l.name}`,
+    label: k ? `level ${k} · ${fmt(l.count)} splats · ≤ ${l.maxScreenHeightPx} px` : `full · ${fmt(l.count)} splats` })), String(info.level));
+}
 
 // ---------- subjects and clips ----------
 
@@ -203,14 +215,14 @@ function swapAB() {
   loadSelection();
 }
 
-function loadSelection() {
+function loadSelection(level = +$('lod').value || 0) {
   const e = entryOf(); if (!e) return;
   const clip = e.clips.find(c => c.name === $('clip').value);
-  if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '' })}`);
+  if (e.name !== '(dropped)') history.replaceState(null, '', `?${new URLSearchParams({ subject: e.name, clip: clip?.name ?? '', ...level ? { lod: level } : {} })}`);
   else history.replaceState(null, '', location.pathname);
   lightURL();
   updateAB();
-  load(e.subject, clip?.source ?? null).finally(() => window.dispatchEvent(new Event('b2cviewer:change')));
+  load(e.subject, clip?.source ?? null, level).finally(() => window.dispatchEvent(new Event('b2cviewer:change')));
 }
 
 async function init() {
@@ -229,16 +241,18 @@ async function init() {
   fillSubjects(q.get('subject') || (rigged[0] || subs[0]).name);
   fillClips(q.get('clip') ?? undefined);
   status(`${subs.length} subjects (${rigged.length} rigged) under ${S.index.root}`);
-  loadSelection();
+  loadSelection(+q.get('lod') || 0);
 }
 
-$('subject').onchange = () => { fillClips(); loadSelection(); };
+$('subject').onchange = () => { fillClips(); loadSelection(0); };
+$('lod').onchange = () => loadSelection();
 
 // A host page (b2canimate) adds clips it produced: `buf` is a .clip.glb or .clip.zip ArrayBuffer for `subject` (an
 // entry name in the subject list). The clip is listed beside the subject's own and selected when that subject shows.
 window.b2cviewerHost = {
   get subject() { return $('subject').value; },
   get clip() { return $('clip').value; },
+  get level() { return S.info?.level ?? 0; },   // the LOD level shown (0 = the full splat)
   get rigged() { return !!S.info?.rigged; },
   get index() { return S.index; },
   // the subject opened from this computer ('(dropped)'): { name, key, buf } or null
@@ -265,9 +279,10 @@ function openFiles(files) {
   }
   if (!subject && S.dropped && clips.length) subject = S.dropped.subject;   // more clips for the dropped subject
   if (!subject) { fail('Drop a subject .glb or .sog (and, if b2crig rigged it, its .clip.glb or .clip.zip files).'); return; }
+  const sameSubject = $('subject').value === '(dropped)' && subject === S.dropped?.subject;   // only clips added: keep the level
   S.dropped = { subject, clips: clips.sort((a, b) => a.name < b.name ? -1 : 1) };
   fillSubjects('(dropped)'); fillClips();
-  loadSelection();
+  loadSelection(sameSubject ? undefined : 0);
 }
 
 const view = $('view');
@@ -608,7 +623,7 @@ async function saveShot() {
   const meta = {
     subject: q.get('subject'), clip: S.info.clip?.name ?? null,
     subject_file: e?.path ?? S.loaded.subject, clip_file: e?.clips.find(c => c.name === $('clip').value)?.path ?? S.loaded.clip,
-    frame: fr, width: W, height: H,
+    frame: fr, width: W, height: H, lod: { level: S.info.level, node: S.info.lods?.[S.info.level]?.node ?? null },
     camera: { name: String(fr), fx: cam.fx, fy: cam.fy, cx: cam.cx, cy: cam.cy, rotation, position: cam.pos },
     orbit: S.orbit, follow: $('follow').checked, fov_deg: +$('fov').value,
     options: { ...renderOpts(), light: undefined, ...frameOpts() },

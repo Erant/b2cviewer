@@ -59,6 +59,12 @@ Also in the panel: the stretch fade (`--cage-fade-start/--cage-fade-end`), the m
 (`--cage-max-growth`), the SH degree and the background colour. The growth and fade start from the subject file's
 render settings (`B2CRIG_rig.render`).
 
+**Detail** (shown only for a splat with LOD levels, b2cgltf SPEC 4.7): the full splat or one of its levels
+(`MSFT_lod` + `B2C_lod` / `B2CRIG_lod`), each labelled with its splat count and the largest on-screen height it is
+meant for (`maxScreenHeightPx`). A rigged level is posed by its own binding and plays the same clips; switching keeps
+the clip, the frame and the view. A chain that is stale (its `source` is not the base's) or broken is not offered, and
+the info line says why. The level is kept in the URL (`?lod=1`) and in the PNG's `lod`. The web form (.sog) has no levels.
+
 ## How it works
 
 It mirrors `b2ctrain render --cage CAGE --cage-max-growth 1.15`:
